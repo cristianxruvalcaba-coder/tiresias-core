@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tiresias Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --surface: #1a1d27;
+      --border: #2a2d3e;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --accent: #6366f1;
+      --green: #22c55e;
+      --yellow: #f59e0b;
+      --red: #ef4444;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: var(--bg); color: var(--text); font-family: system-ui, sans-serif; font-size: 14px; }
+    header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 12px 24px; display: flex; align-items: center; gap: 16px; }
+    header h1 { font-size: 18px; font-weight: 600; color: var(--accent); }
+    nav { display: flex; gap: 8px; margin-left: auto; }
+    nav button { background: transparent; border: 1px solid var(--border); color: var(--text); padding: 6px 14px; border-radius: 6px; cursor: pointer; }
+    nav button.active { background: var(--accent); border-color: var(--accent); }
+    .key-bar { background: var(--surface); border-bottom: 1px solid var(--border); padding: 10px 24px; display: flex; gap: 8px; align-items: center; }
+    .key-bar input { flex: 1; max-width: 480px; background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 6px 12px; border-radius: 6px; font-family: monospace; }
+    .key-bar button { background: var(--accent); border: none; color: #fff; padding: 6px 14px; border-radius: 6px; cursor: pointer; }
+    .key-bar span { color: var(--muted); font-size: 12px; }
+    main { padding: 24px; }
+    .panel { display: none; }
+    .panel.active { display: block; }
+    .cards { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 24px; }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px 20px; min-width: 180px; }
+    .card .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; }
+    .card .value { font-size: 24px; font-weight: 700; }
+    .chart-box { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 24px; }
+    .chart-box h3 { font-size: 14px; font-weight: 600; margin-bottom: 12px; color: var(--muted); }
+    table { width: 100%; border-collapse: collapse; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+    th { background: var(--bg); color: var(--muted); font-size: 12px; text-transform: uppercase; padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--border); }
+    td { padding: 10px 14px; border-bottom: 1px solid var(--border); }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: rgba(99,102,241,0.05); }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 9999px; font-size: 11px; font-weight: 600; }
+    .badge-up { background: rgba(34,197,94,0.15); color: var(--green); }
+    .badge-down { background: rgba(239,68,68,0.15); color: var(--red); }
+    .badge-degraded { background: rgba(245,158,11,0.15); color: var(--yellow); }
+    .section-title { font-size: 16px; font-weight: 600; margin-bottom: 12px; }
+    .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 100; align-items: center; justify-content: center; }
+    .modal-overlay.open { display: flex; }
+    .modal { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; width: 90%; max-width: 860px; max-height: 85vh; overflow-y: auto; padding: 24px; }
+    .modal h2 { font-size: 16px; font-weight: 600; margin-bottom: 16px; }
+    .turn { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; margin-bottom: 12px; }
+    .turn .meta { color: var(--muted); font-size: 11px; margin-bottom: 8px; }
+    .turn .prompt-label { color: var(--yellow); font-size: 11px; font-weight: 600; margin-bottom: 4px; }
+    .turn .completion-label { color: var(--green); font-size: 11px; font-weight: 600; margin-bottom: 4px; margin-top: 8px; }
+    .turn pre { white-space: pre-wrap; word-break: break-word; font-family: monospace; font-size: 12px; color: var(--text); }
+    .close-btn { float: right; background: transparent; border: 1px solid var(--border); color: var(--muted); padding: 4px 10px; border-radius: 4px; cursor: pointer; margin-top: -4px; }
+    #error-banner { display: none; background: rgba(239,68,68,0.15); border: 1px solid var(--red); color: var(--red); padding: 8px 16px; border-radius: 6px; margin-bottom: 16px; }
+    .refresh-btn { background: transparent; border: 1px solid var(--border); color: var(--text); padding: 6px 14px; border-radius: 6px; cursor: pointer; margin-left: 8px; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>Tiresias</h1>
+  <nav>
+    <button class="active" onclick="showPanel('overview')">Overview</button>
+    <button onclick="showPanel('sessions')">Sessions</button>
+    <button onclick="showPanel('providers')">Providers</button>
+  </nav>
+  <button class="refresh-btn" onclick="loadAll()">&#8635; Refresh</button>
+</header>
+
+<div class="key-bar">
+  <span>API Key:</span>
+  <input type="password" id="api-key-input" placeholder="Enter Tiresias API key..." />
+  <button onclick="saveKey()">Save</button>
+  <span id="key-status"></span>
+</div>
+
+<main>
+  <div id="error-banner"></div>
+
+  <!-- Overview Panel -->
+  <div id="panel-overview" class="panel active">
+    <div class="cards" id="spend-cards">
+      <div class="card"><div class="label">Total Spend (30d)</div><div class="value" id="card-cost">—</div></div>
+      <div class="card"><div class="label">Requests (30d)</div><div class="value" id="card-requests">—</div></div>
+      <div class="card"><div class="label">Tokens (30d)</div><div class="value" id="card-tokens">—</div></div>
+    </div>
+    <div class="chart-box">
+      <h3>Requests / Day</h3>
+      <canvas id="requests-chart" height="80"></canvas>
+    </div>
+    <div class="chart-box">
+      <h3>Latency Percentiles by Provider (ms)</h3>
+      <canvas id="latency-chart" height="80"></canvas>
+    </div>
+  </div>
+
+  <!-- Sessions Panel -->
+  <div id="panel-sessions" class="panel">
+    <p class="section-title">Top Sessions by Cost</p>
+    <table>
+      <thead><tr><th>Session ID</th><th>Cost (USD)</th><th>Requests</th><th>Tokens</th><th>Last Active</th><th></th></tr></thead>
+      <tbody id="sessions-tbody"><tr><td colspan="6" style="color:var(--muted)">Loading...</td></tr></tbody>
+    </table>
+  </div>
+
+  <!-- Providers Panel -->
+  <div id="panel-providers" class="panel">
+    <p class="section-title">Provider Health</p>
+    <div class="cards" id="health-cards">Loading...</div>
+    <br/>
+    <p class="section-title">Error Rates (30d)</p>
+    <table>
+      <thead><tr><th>Provider</th><th>Total Requests</th><th>Errors</th><th>Error Rate</th><th>Status Codes</th></tr></thead>
+      <tbody id="errors-tbody"><tr><td colspan="5" style="color:var(--muted)">Loading...</td></tr></tbody>
+    </table>
+  </div>
+</main>
+
+<!-- Session Replay Modal -->
+<div class="modal-overlay" id="replay-modal">
+  <div class="modal">
+    <button class="close-btn" onclick="closeModal()">Close</button>
+    <h2 id="replay-title">Session Replay</h2>
+    <div id="replay-turns">Loading turns...</div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

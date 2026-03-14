@@ -1,0 +1,46 @@
+# Python virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+*.cover
+
+# Compiled extensions
+*.so
+*.dylib
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Data (never commit tenant DBs)
+/data/
+
+# Internal planning (never public)
+.planning/
