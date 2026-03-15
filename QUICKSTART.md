@@ -13,7 +13,7 @@ From clone to first dashboard data in under 10 minutes.
 ### 1. Clone and configure (2 min)
 
 ```bash
-git clone https://github.com/cristianxruvalcaba-coder/tiresias.git
+git clone https://github.com/cristianxruvalcaba-coder/tiresias-core.git
 cd tiresias
 cp .env.example .env
 ```
@@ -96,3 +96,9 @@ curl http://localhost:8080/health   # proxy
 curl http://localhost:3000/health   # dashboard
 curl http://localhost:8090/health   # relay
 ```
+
+## Support
+
+- Docs issues / questions: open a [GitHub issue](https://github.com/cristianxruvalcaba-coder/tiresias-core/issues)
+- Email: support@saluca.com
+- Enterprise: enterprise@saluca.com
