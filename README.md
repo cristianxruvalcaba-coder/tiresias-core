@@ -13,7 +13,7 @@ and any LLM provider (OpenAI, Anthropic, Gemini, Groq) to get:
 - Token cost tracking and budget alerts
 - Multi-provider routing with automatic failover
 - API analytics for non-LLM APIs (Stripe, Twilio, etc.)
-- License-gated enterprise features (BYOK, Argus security context)
+- License-gated enterprise features (BYOK, Aletheia security context)
 
 **Self-hosted in under 10 minutes.** Single Docker Compose command.
 
@@ -40,18 +40,18 @@ Point your OpenAI SDK at `http://localhost:8080/v1` — no code changes required
 | Non-LLM API analytics | YES | No | No | No | Yes | No |
 | Open source (core) | Apache 2.0 | MIT | Apache 2.0 | MIT | Closed | Closed |
 | License relay (air-gap) | YES (ent) | No | No | No | No | No |
-| Argus security context | YES (ent) | No | No | No | No | No |
+| Aletheia security context | YES (ent) | No | No | No | No | No |
 
 ## Module Structure
 
 | Module | License | Description |
 |--------|---------|-------------|
 | `tiresias-core` | Apache 2.0 | Proxy, dashboard, analytics, multi-provider routing |
-| `tiresias-enterprise` | Commercial | BYOK, license system, Argus integration |
+| `tiresias-enterprise` | Commercial | BYOK, license system, Aletheia integration |
 
 ## Enterprise
 
-Contact enterprise@saluca.com for BYOK encryption, Argus security context injection,
+Contact enterprise@saluca.com for BYOK encryption, Aletheia security context injection,
 air-gapped license relay, and MSSP/partner licensing.
 
 ---
