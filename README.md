@@ -1,5 +1,11 @@
 # Tiresias
 
+> **This project has moved to [saluca-labs](https://github.com/saluca-labs).** This repo is now maintained at [`saluca-labs/tiresias-core`](https://github.com/saluca-labs/tiresias-core). Please update your remotes:
+> ```bash
+> git remote set-url origin https://github.com/saluca-labs/tiresias-core.git
+> ```
+
+
 **AI observability proxy — model-agnostic, self-hosted, production-ready.**
 
 > "Tiresias sees all AI interactions, regardless of which model is speaking."
