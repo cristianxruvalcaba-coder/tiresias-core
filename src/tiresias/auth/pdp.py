@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import structlog
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -55,11 +56,13 @@ class PolicyDecisionPoint:
         if rule is None:
             # No matching rule -- use default action
             if sop_policy.default_action == "queue_for_approval":
+                generated_approval_id = str(uuid.uuid4())
                 audit_ref = self.audit.log_event("sop_deny", {
                     "identity": identity,
                     "sop_id": sop_id,
                     "action": action,
                     "reason": "no matching rule, default=queue_for_approval",
+                    "approval_id": generated_approval_id,
                 })
                 return SOPDecision(
                     decision="queue_for_approval",
@@ -67,6 +70,7 @@ class PolicyDecisionPoint:
                     action=action,
                     reason="No matching SOP rule; default is queue for approval",
                     audit_ref=audit_ref,
+                    approval_id=generated_approval_id,
                 )
             else:
                 # default is deny (or advisory enforcement with no match still denies by default_action)
@@ -139,12 +143,14 @@ class PolicyDecisionPoint:
 
         # Step 6: Grant or queue for approval
         if rule.requires_approval:
+            generated_approval_id = str(uuid.uuid4())
             audit_ref = self.audit.log_event("sop_grant", {
                 "identity": identity,
                 "sop_id": sop_id,
                 "action": action,
                 "reason": "rule match, requires approval",
                 "approval_priority": rule.approval_priority,
+                "approval_id": generated_approval_id,
             })
             return SOPDecision(
                 decision="queue_for_approval",
@@ -152,6 +158,7 @@ class PolicyDecisionPoint:
                 action=action,
                 reason=f"SOP rule requires human approval (priority {rule.approval_priority})",
                 audit_ref=audit_ref,
+                approval_id=generated_approval_id,
             )
 
         # Advisory mode warning

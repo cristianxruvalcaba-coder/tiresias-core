@@ -454,6 +454,109 @@ class TestEvaluateSOPEndpoint:
         assert resp.json()["decision"] == "queue_for_approval"
 
 
+# ---------------------------------------------------------------------------
+# Task 4 (22-02): Approval ID population tests (SP-06)
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+
+class TestApprovalIdPopulation:
+    def test_queue_for_approval_has_approval_id(self):
+        """When requires_approval=True, SOPDecision.approval_id is a non-None UUID string."""
+        policy = SOPPolicy(
+            rules=[
+                SOPRule(
+                    sop_id="SOP-002",
+                    allowed_actions=["remediate"],
+                    requires_approval=True,
+                    approval_priority="P0",
+                )
+            ]
+        )
+        pdp = _make_pdp_with_policy(policy)
+        result = pdp.evaluate_sop_compliance(
+            identity="alfred", tenant="saluca", sop_id="SOP-002", action="remediate"
+        )
+        assert result.decision == "queue_for_approval"
+        assert result.approval_id is not None
+        assert _re.match(
+            r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+            result.approval_id,
+        ), f"approval_id {result.approval_id!r} is not a valid UUID"
+
+    def test_queue_for_approval_default_no_match_has_approval_id(self):
+        """When default_action='queue_for_approval' and no rule matches, approval_id is non-None UUID."""
+        policy = SOPPolicy(rules=[], default_action="queue_for_approval")
+        pdp = _make_pdp_with_policy(policy)
+        result = pdp.evaluate_sop_compliance(
+            identity="alfred", tenant="saluca", sop_id="SOP-999", action="unknown"
+        )
+        assert result.decision == "queue_for_approval"
+        assert result.approval_id is not None
+        assert _re.match(
+            r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+            result.approval_id,
+        ), f"approval_id {result.approval_id!r} is not a valid UUID"
+
+    def test_grant_has_no_approval_id(self):
+        """When requires_approval=False and action is granted, approval_id remains None."""
+        policy = SOPPolicy(
+            rules=[SOPRule(sop_id="SOP-001", allowed_actions=["collect_data"])],
+            default_action="deny",
+        )
+        pdp = _make_pdp_with_policy(policy)
+        result = pdp.evaluate_sop_compliance(
+            identity="alfred", tenant="saluca", sop_id="SOP-001", action="collect_data"
+        )
+        assert result.decision == "grant"
+        assert result.approval_id is None
+
+    def test_deny_has_no_approval_id(self):
+        """When action is denied, approval_id remains None."""
+        policy = SOPPolicy(rules=[], default_action="deny")
+        pdp = _make_pdp_with_policy(policy)
+        result = pdp.evaluate_sop_compliance(
+            identity="alfred", tenant="saluca", sop_id="SOP-999", action="unknown"
+        )
+        assert result.decision == "deny"
+        assert result.approval_id is None
+
+    def test_approval_id_logged_in_audit(self):
+        """Audit event for queue_for_approval includes the approval_id value."""
+        policy = SOPPolicy(
+            rules=[
+                SOPRule(
+                    sop_id="SOP-002",
+                    allowed_actions=["remediate"],
+                    requires_approval=True,
+                    approval_priority="P1",
+                )
+            ]
+        )
+        mock_audit = MagicMock(spec=AuditLogger)
+        mock_audit.log_event.return_value = "some-uuid"
+        loader = MagicMock()
+        loader.load_sop_policy.return_value = policy
+        pdp = PolicyDecisionPoint(policy_loader=loader, audit_logger=mock_audit)
+
+        result = pdp.evaluate_sop_compliance(
+            identity="alfred", tenant="saluca", sop_id="SOP-002", action="remediate"
+        )
+        assert result.decision == "queue_for_approval"
+        assert result.approval_id is not None
+
+        # Find the sop_grant call and verify approval_id in payload
+        grant_calls = [
+            c for c in mock_audit.log_event.call_args_list
+            if c[0][0] == "sop_grant"
+        ]
+        assert len(grant_calls) == 1, "Expected exactly one sop_grant audit call"
+        payload = grant_calls[0][0][1]
+        assert "approval_id" in payload, f"approval_id not in audit payload: {payload}"
+        assert payload["approval_id"] == result.approval_id
+
+
 class TestPersonaYAMLFiles:
     _POLICY_DIR = Path("/repos/tiresias-core/policies/tenants/saluca/personas")
 
