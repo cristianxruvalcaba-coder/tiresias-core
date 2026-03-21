@@ -1,0 +1,16 @@
+spec:
+  sop_policies:
+    enforcement: strict
+    default_action: deny
+    rules:
+      - sop_id: "SOP-011"
+        allowed_actions: ["collect_data", "generate_report", "deliver"]
+        requires_approval: false
+      - sop_id: "SOP-025"
+        allowed_actions: ["collect_data", "generate_report", "deliver"]
+        requires_approval: false
+      - sop_id: "SOP-011"
+        allowed_actions: ["modify_budget", "approve_spend"]
+        requires_approval: true
+        approval_priority: "P0"
+        max_spend_usd: 500.0

@@ -1,0 +1,32 @@
+spec:
+  sop_policies:
+    enforcement: strict
+    default_action: queue_for_approval
+    rules:
+      - sop_id: "SOP-001"
+        allowed_actions: ["collect_data", "analyze", "recommend"]
+        requires_approval: false
+      - sop_id: "SOP-001"
+        allowed_actions: ["implement"]
+        requires_approval: true
+        approval_priority: "P1"
+      - sop_id: "SOP-002"
+        allowed_actions: ["collect_advisories", "triage", "assess"]
+        requires_approval: false
+      - sop_id: "SOP-002"
+        allowed_actions: ["remediate"]
+        requires_approval: true
+        approval_priority: "P0"
+      - sop_id: "SOP-003"
+        allowed_actions: ["collect_data", "generate_report", "deliver"]
+        requires_approval: false
+      - sop_id: "SOP-011"
+        allowed_actions: ["collect_data", "generate_report", "deliver"]
+        requires_approval: false
+      - sop_id: "SOP-026"
+        allowed_actions: ["assess", "propose"]
+        requires_approval: false
+      - sop_id: "SOP-026"
+        allowed_actions: ["stage", "deploy"]
+        requires_approval: true
+        approval_priority: "P1"

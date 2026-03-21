@@ -1,0 +1,19 @@
+spec:
+  sop_policies:
+    enforcement: strict
+    default_action: queue_for_approval
+    rules:
+      - sop_id: "SOP-003"
+        allowed_actions: ["collect_data", "generate_report", "deliver"]
+        requires_approval: false
+      - sop_id: "SOP-009"
+        allowed_actions: ["collect_data", "analyze", "recommend"]
+        requires_approval: false
+      - sop_id: "SOP-009"
+        allowed_actions: ["implement", "deploy"]
+        requires_approval: true
+        approval_priority: "P1"
+      - sop_id: "SOP-003"
+        allowed_actions: ["modify_architecture"]
+        requires_approval: true
+        approval_priority: "P0"
