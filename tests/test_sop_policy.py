@@ -557,6 +557,121 @@ class TestApprovalIdPopulation:
         assert payload["approval_id"] == result.approval_id
 
 
+# ---------------------------------------------------------------------------
+# Task 5 (22-02): Rate limit enforcement tests (SP-08)
+# ---------------------------------------------------------------------------
+
+from tiresias.auth.pdp import InMemoryExecutionLog
+
+
+class TestRateLimitEnforcement:
+    def _make_pdp_with_rate_policy(self, rate_limit: str) -> PolicyDecisionPoint:
+        """Build PDP with a single rule having the given rate_limit."""
+        policy = SOPPolicy(
+            rules=[
+                SOPRule(
+                    sop_id="SOP-001",
+                    allowed_actions=["generate_report"],
+                    rate_limit=rate_limit,
+                )
+            ],
+            default_action="deny",
+        )
+        log = InMemoryExecutionLog()
+        loader = MagicMock()
+        loader.load_sop_policy.return_value = policy
+        return PolicyDecisionPoint(policy_loader=loader, execution_log=log)
+
+    def test_rate_limit_1_per_day_first_call_passes(self):
+        """First call with rate_limit='1/day' returns grant (no prior executions)."""
+        pdp = self._make_pdp_with_rate_policy("1/day")
+        result = pdp.evaluate_sop_compliance(
+            identity="alfred", tenant="saluca", sop_id="SOP-001", action="generate_report"
+        )
+        assert result.decision == "grant"
+
+    def test_rate_limit_1_per_day_second_call_denied(self):
+        """After one execution, second call with rate_limit='1/day' returns deny."""
+        pdp = self._make_pdp_with_rate_policy("1/day")
+        r1 = pdp.evaluate_sop_compliance(
+            identity="alfred", tenant="saluca", sop_id="SOP-001", action="generate_report"
+        )
+        assert r1.decision == "grant"
+        r2 = pdp.evaluate_sop_compliance(
+            identity="alfred", tenant="saluca", sop_id="SOP-001", action="generate_report"
+        )
+        assert r2.decision == "deny"
+        assert "Rate limit exceeded" in r2.reason
+
+    def test_rate_limit_5_per_hour_allows_up_to_5(self):
+        """5 calls pass with rate_limit='5/hour', 6th is denied."""
+        pdp = self._make_pdp_with_rate_policy("5/hour")
+        for i in range(5):
+            r = pdp.evaluate_sop_compliance(
+                identity="alfred", tenant="saluca", sop_id="SOP-001", action="generate_report"
+            )
+            assert r.decision == "grant", f"Call {i+1} should grant, got {r.decision}"
+        r6 = pdp.evaluate_sop_compliance(
+            identity="alfred", tenant="saluca", sop_id="SOP-001", action="generate_report"
+        )
+        assert r6.decision == "deny"
+
+    def test_rate_limit_expired_entries_ignored(self):
+        """Entries older than the window period are not counted."""
+        from datetime import timedelta
+        log = InMemoryExecutionLog()
+        # Inject an entry 25 hours ago (outside 1/day window)
+        old_ts = datetime.now(timezone.utc) - timedelta(hours=25)
+        log._log["alfred:SOP-001:generate_report"].append(old_ts)
+
+        policy = SOPPolicy(
+            rules=[SOPRule(sop_id="SOP-001", allowed_actions=["generate_report"], rate_limit="1/day")],
+            default_action="deny",
+        )
+        loader = MagicMock()
+        loader.load_sop_policy.return_value = policy
+        pdp = PolicyDecisionPoint(policy_loader=loader, execution_log=log)
+        result = pdp.evaluate_sop_compliance(
+            identity="alfred", tenant="saluca", sop_id="SOP-001", action="generate_report"
+        )
+        assert result.decision == "grant", "Old entry outside window should not count"
+
+    def test_rate_limit_parse_formats(self):
+        """_parse_rate_limit correctly parses day/hour/minute periods."""
+        assert PolicyDecisionPoint._parse_rate_limit("1/day") == (1, 86400)
+        assert PolicyDecisionPoint._parse_rate_limit("5/hour") == (5, 3600)
+        assert PolicyDecisionPoint._parse_rate_limit("10/minute") == (10, 60)
+
+    def test_rate_limit_invalid_format_passes(self):
+        """Malformed rate_limit string fails open (returns None from parse, grants from PDP)."""
+        assert PolicyDecisionPoint._parse_rate_limit("bad") is None
+        # Also verify the PDP fails open
+        pdp = self._make_pdp_with_rate_policy("bad_format")
+        result = pdp.evaluate_sop_compliance(
+            identity="alfred", tenant="saluca", sop_id="SOP-001", action="generate_report"
+        )
+        assert result.decision == "grant", "Malformed rate_limit should fail open (grant)"
+
+    def test_rate_limit_custom_execution_log(self):
+        """PDP accepts optional execution_log; count_since is called on rate limit checks."""
+        mock_log = MagicMock(spec=InMemoryExecutionLog)
+        mock_log.count_since.return_value = 0  # Within limit
+
+        policy = SOPPolicy(
+            rules=[SOPRule(sop_id="SOP-001", allowed_actions=["generate_report"], rate_limit="5/hour")],
+            default_action="deny",
+        )
+        loader = MagicMock()
+        loader.load_sop_policy.return_value = policy
+        pdp = PolicyDecisionPoint(policy_loader=loader, execution_log=mock_log)
+
+        pdp.evaluate_sop_compliance(
+            identity="alfred", tenant="saluca", sop_id="SOP-001", action="generate_report"
+        )
+        mock_log.count_since.assert_called_once()
+        mock_log.record.assert_called_once_with("alfred", "SOP-001", "generate_report")
+
+
 class TestPersonaYAMLFiles:
     _POLICY_DIR = Path("/repos/tiresias-core/policies/tenants/saluca/personas")
 

@@ -1,9 +1,11 @@
 """Policy Decision Point -- evaluates SOP compliance."""
 from __future__ import annotations
 
+import re
 import structlog
 import uuid
-from datetime import datetime, timezone
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from tiresias.policy.sop_policy import SOPDecision, SOPPolicy, SOPRule
@@ -12,12 +14,42 @@ from tiresias.audit.logger import AuditLogger
 logger = structlog.get_logger(__name__)
 
 
+class ExecutionLog:
+    """Interface for tracking SOP action executions for rate limiting."""
+
+    def record(self, identity: str, sop_id: str, action: str) -> None:
+        """Record an execution event."""
+        raise NotImplementedError
+
+    def count_since(self, identity: str, sop_id: str, action: str, since: datetime) -> int:
+        """Count executions since the given timestamp."""
+        raise NotImplementedError
+
+
+class InMemoryExecutionLog(ExecutionLog):
+    """In-memory execution log for rate limiting. Suitable for single-process deployments."""
+
+    def __init__(self):
+        self._log: dict[str, list[datetime]] = defaultdict(list)
+
+    def _key(self, identity: str, sop_id: str, action: str) -> str:
+        return f"{identity}:{sop_id}:{action}"
+
+    def record(self, identity: str, sop_id: str, action: str) -> None:
+        self._log[self._key(identity, sop_id, action)].append(datetime.now(timezone.utc))
+
+    def count_since(self, identity: str, sop_id: str, action: str, since: datetime) -> int:
+        key = self._key(identity, sop_id, action)
+        return sum(1 for ts in self._log[key] if ts >= since)
+
+
 class PolicyDecisionPoint:
     """Evaluates agent SOP compliance against persona policies."""
 
-    def __init__(self, policy_loader=None, audit_logger: AuditLogger | None = None):
+    def __init__(self, policy_loader=None, audit_logger: AuditLogger | None = None, execution_log: ExecutionLog | None = None):
         self.policy_loader = policy_loader
         self.audit = audit_logger or AuditLogger()
+        self.execution_log = execution_log or InMemoryExecutionLog()
 
     def evaluate_sop_compliance(
         self,
@@ -171,6 +203,7 @@ class PolicyDecisionPoint:
             "action": action,
             "reason": "rule match, no approval required",
         })
+        self.execution_log.record(identity, sop_id, action)
         return SOPDecision(
             decision="grant",
             sop_id=sop_id,
@@ -203,8 +236,32 @@ class PolicyDecisionPoint:
         except Exception:
             return True  # Fail open on parse error
 
+    @staticmethod
+    def _parse_rate_limit(limit: str) -> tuple[int, int] | None:
+        """Parse rate limit string like '1/day', '5/hour', '10/minute'.
+
+        Returns (max_count, window_seconds) or None if unparseable.
+        """
+        match = re.match(r'^(\d+)/(day|hour|minute)$', limit)
+        if not match:
+            return None
+        count = int(match.group(1))
+        period = match.group(2)
+        seconds = {"day": 86400, "hour": 3600, "minute": 60}[period]
+        return (count, seconds)
+
     def _check_rate_limit(self, identity: str, sop_id: str, action: str, limit: str) -> bool:
-        """Check rate limit (e.g. '1/day', '5/hour'). Placeholder -- needs execution log."""
-        # TODO: Query execution log for count in window
-        # For now, always passes (rate limiting requires execution tracking)
-        return True
+        """Check rate limit (e.g. '1/day', '5/hour').
+
+        Returns False if limit exceeded, True if within limit.
+        Fails open on parse errors (returns True).
+        """
+        parsed = self._parse_rate_limit(limit)
+        if parsed is None:
+            logger.warning("rate_limit_parse_failed", limit=limit, identity=identity)
+            return True  # Fail open on unparseable limit
+
+        max_count, window_seconds = parsed
+        since = datetime.now(timezone.utc) - timedelta(seconds=window_seconds)
+        current_count = self.execution_log.count_since(identity, sop_id, action, since)
+        return current_count < max_count
