@@ -10,10 +10,12 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from tiresias.auth.pdp import PolicyDecisionPoint
 from tiresias.bootstrap import first_boot
 from tiresias.config import TiresiasSettings, parse_providers
 from tiresias.encryption.envelope import EnvelopeEncryption
 from tiresias.encryption.providers import resolve_kek_provider
+from tiresias.policy.loader import DirectoryPolicyLoader
 from tiresias.proxy.interceptor import record_error_turn, record_turn
 from tiresias.providers import build_provider
 from tiresias.providers.health import HealthTracker
@@ -28,6 +30,7 @@ _envelope: EnvelopeEncryption | None = None
 _http_client: httpx.AsyncClient | None = None
 _router: ProviderRouter | None = None
 _health: HealthTracker | None = None
+_pdp: PolicyDecisionPoint | None = None
 
 
 def get_settings() -> TiresiasSettings:
@@ -58,6 +61,10 @@ def get_health() -> HealthTracker:
     if _health is None:
         raise RuntimeError("App not initialized")
     return _health
+
+
+def get_pdp() -> PolicyDecisionPoint | None:
+    return _pdp
 
 
 def _detect_provider(upstream_url: str) -> str:
@@ -96,13 +103,24 @@ def _build_router(
 def create_app(settings: TiresiasSettings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        global _settings, _envelope, _http_client, _router, _health
+        global _settings, _envelope, _http_client, _router, _health, _pdp
         cfg = settings or TiresiasSettings()
         _settings = cfg
         provider = resolve_kek_provider(cfg)
         _envelope = EnvelopeEncryption(provider)
         _http_client = httpx.AsyncClient(timeout=httpx.Timeout(300.0))
         _router, _health = _build_router(cfg, _http_client)
+
+        # PDP initialization (only when policy_enabled)
+        if cfg.policy_enabled:
+            loader = DirectoryPolicyLoader(policies_dir=cfg.policies_dir)
+            _pdp = PolicyDecisionPoint(policy_loader=loader)
+            logger.info(
+                "PDP enabled (enforcement=%s, policies_dir=%s)",
+                cfg.policy_enforcement_mode,
+                cfg.policies_dir,
+            )
+
         engine = await get_engine(cfg.tenant_id, cfg.data_root)
         async with AsyncSession(engine) as session:
             api_key = await first_boot(cfg.tenant_id, cfg, session)
@@ -147,6 +165,82 @@ def create_app(settings: TiresiasSettings | None = None) -> FastAPI:
             for k, v in request.headers.items()
             if k.lower() not in ("host", "content-length", "transfer-encoding")
         }
+
+        # ---- PDP policy check ----
+        pdp = get_pdp()
+        policy_decision = None
+        if pdp is not None:
+            user_id = (
+                request.headers.get("x-tiresias-user-id") or cfg.tenant_id
+            )
+            sop_context = {
+                "model": model,
+                "estimated_cost_usd": 0.0,  # real cost unknown pre-call
+                "action": "chat_completion",
+            }
+            policy_decision = pdp.evaluate_sop_compliance(
+                identity=user_id,
+                tenant=cfg.tenant_id,
+                sop_id="model-access",
+                action="chat_completion",
+                context=sop_context,
+            )
+            # Also check model-specific rules (e.g. "expensive-models")
+            model_decision = pdp.evaluate_sop_compliance(
+                identity=user_id,
+                tenant=cfg.tenant_id,
+                sop_id="expensive-models",
+                action="chat_completion",
+                context=sop_context,
+            )
+            # If the model-specific rule matched and is more restrictive, use it
+            if model_decision.decision != "deny" or policy_decision.decision == "deny":
+                # model_decision matched a rule (not default-deny) -- prefer it
+                if model_decision.sop_id == "expensive-models" and model_decision.decision != "deny":
+                    policy_decision = model_decision
+            advisory = cfg.policy_enforcement_mode == "advisory"
+            if advisory:
+                logger.info(
+                    "PDP advisory: decision=%s reason=%s",
+                    policy_decision.decision,
+                    policy_decision.reason,
+                )
+            else:
+                if policy_decision.decision == "deny":
+                    # Attach to metadata for audit
+                    if extra_metadata is None:
+                        extra_metadata = {}
+                    extra_metadata["policy_decision"] = policy_decision.model_dump()
+                    return Response(
+                        content=json.dumps({
+                            "error": {
+                                "message": f"Policy denied: {policy_decision.reason}",
+                                "type": "policy_error",
+                                "code": "policy_denied",
+                                "sop_id": policy_decision.sop_id,
+                                "audit_ref": policy_decision.audit_ref,
+                            }
+                        }),
+                        status_code=403,
+                        media_type="application/json",
+                    )
+                elif policy_decision.decision == "queue_for_approval":
+                    return Response(
+                        content=json.dumps({
+                            "status": "queued_for_approval",
+                            "approval_id": policy_decision.approval_id,
+                            "reason": policy_decision.reason,
+                            "sop_id": policy_decision.sop_id,
+                            "audit_ref": policy_decision.audit_ref,
+                        }),
+                        status_code=202,
+                        media_type="application/json",
+                    )
+            # Attach decision to metadata for audit trail
+            if extra_metadata is None:
+                extra_metadata = {}
+            extra_metadata["policy_decision"] = policy_decision.model_dump()
+        # ---- end PDP check ----
 
         if is_streaming:
             upstream_url = cfg.upstream_url.rstrip("/")

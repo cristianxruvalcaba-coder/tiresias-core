@@ -1,0 +1,15 @@
+rules:
+  - sop_id: "model-access"
+    allowed_actions: ["chat_completion"]
+    requires_approval: false
+    rate_limit: "100/hour"
+    allowed_outputs: ["*"]
+    max_spend_usd: 50
+  - sop_id: "expensive-models"
+    allowed_actions: ["chat_completion"]
+    requires_approval: true
+    conditions:
+      model_pattern: "claude-opus.*|gpt-4.*|o1.*"
+    max_spend_usd: 10
+default_action: "deny"
+enforcement: "strict"

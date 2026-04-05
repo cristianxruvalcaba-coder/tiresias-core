@@ -39,6 +39,7 @@ class TiresiasSettings(BaseSettings):
 
     # Storage
     data_root: Path = Field(default=Path("/data"), alias="TIRESIAS_DATA_ROOT")
+    database_url: str | None = Field(default=None, alias="TIRESIAS_DATABASE_URL")
 
     # Purge
     purge_dek: bool = Field(default=False, alias="TIRESIAS_PURGE_DEK")
@@ -75,6 +76,13 @@ class TiresiasSettings(BaseSettings):
     # GCP Secret Manager
     gcp_project_id: str | None = Field(default=None, alias="TIRESIAS_GCP_PROJECT_ID")
     gcp_secret_id: str | None = Field(default=None, alias="TIRESIAS_GCP_SECRET_ID")
+
+    # Policy Decision Point (PDP)
+    policy_enabled: bool = Field(default=False, alias="TIRESIAS_POLICY_ENABLED")
+    policies_dir: str = Field(default="policies", alias="TIRESIAS_POLICIES_DIR")
+    policy_enforcement_mode: str = Field(
+        default="strict", alias="TIRESIAS_POLICY_ENFORCEMENT_MODE",
+    )  # "strict" = block on deny, "advisory" = log only
 
 
 def parse_providers(providers_str: str) -> list[str]:

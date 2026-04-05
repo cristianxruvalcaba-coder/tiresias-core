@@ -561,7 +561,7 @@ class TestApprovalIdPopulation:
 # Task 5 (22-02): Rate limit enforcement tests (SP-08)
 # ---------------------------------------------------------------------------
 
-from tiresias.auth.pdp import InMemoryExecutionLog
+from tiresias.auth.rate_limiter import SlidingWindowRateLimiter, parse_rate_limit
 
 
 class TestRateLimitEnforcement:
@@ -577,10 +577,9 @@ class TestRateLimitEnforcement:
             ],
             default_action="deny",
         )
-        log = InMemoryExecutionLog()
         loader = MagicMock()
         loader.load_sop_policy.return_value = policy
-        return PolicyDecisionPoint(policy_loader=loader, execution_log=log)
+        return PolicyDecisionPoint(policy_loader=loader)
 
     def test_rate_limit_1_per_day_first_call_passes(self):
         """First call with rate_limit='1/day' returns grant (no prior executions)."""
@@ -618,11 +617,11 @@ class TestRateLimitEnforcement:
 
     def test_rate_limit_expired_entries_ignored(self):
         """Entries older than the window period are not counted."""
-        from datetime import timedelta
-        log = InMemoryExecutionLog()
-        # Inject an entry 25 hours ago (outside 1/day window)
-        old_ts = datetime.now(timezone.utc) - timedelta(hours=25)
-        log._log["alfred:SOP-001:generate_report"].append(old_ts)
+        import time
+        rate_limiter = SlidingWindowRateLimiter()
+        rl_key = "alfred:SOP-001:generate_report"
+        # Inject an entry that is already expired by manipulating the deque directly
+        rate_limiter._windows[rl_key] = __import__("collections").deque([time.monotonic() - 90000])
 
         policy = SOPPolicy(
             rules=[SOPRule(sop_id="SOP-001", allowed_actions=["generate_report"], rate_limit="1/day")],
@@ -630,21 +629,21 @@ class TestRateLimitEnforcement:
         )
         loader = MagicMock()
         loader.load_sop_policy.return_value = policy
-        pdp = PolicyDecisionPoint(policy_loader=loader, execution_log=log)
+        pdp = PolicyDecisionPoint(policy_loader=loader, rate_limiter=rate_limiter)
         result = pdp.evaluate_sop_compliance(
             identity="alfred", tenant="saluca", sop_id="SOP-001", action="generate_report"
         )
         assert result.decision == "grant", "Old entry outside window should not count"
 
     def test_rate_limit_parse_formats(self):
-        """_parse_rate_limit correctly parses day/hour/minute periods."""
-        assert PolicyDecisionPoint._parse_rate_limit("1/day") == (1, 86400)
-        assert PolicyDecisionPoint._parse_rate_limit("5/hour") == (5, 3600)
-        assert PolicyDecisionPoint._parse_rate_limit("10/minute") == (10, 60)
+        """parse_rate_limit correctly parses day/hour/minute periods."""
+        assert parse_rate_limit("1/day") == (1, 86400)
+        assert parse_rate_limit("5/hour") == (5, 3600)
+        assert parse_rate_limit("10/minute") == (10, 60)
 
     def test_rate_limit_invalid_format_passes(self):
         """Malformed rate_limit string fails open (returns None from parse, grants from PDP)."""
-        assert PolicyDecisionPoint._parse_rate_limit("bad") is None
+        assert parse_rate_limit("bad") is None
         # Also verify the PDP fails open
         pdp = self._make_pdp_with_rate_policy("bad_format")
         result = pdp.evaluate_sop_compliance(
@@ -652,10 +651,14 @@ class TestRateLimitEnforcement:
         )
         assert result.decision == "grant", "Malformed rate_limit should fail open (grant)"
 
-    def test_rate_limit_custom_execution_log(self):
-        """PDP accepts optional execution_log; count_since is called on rate limit checks."""
-        mock_log = MagicMock(spec=InMemoryExecutionLog)
-        mock_log.count_since.return_value = 0  # Within limit
+    def test_rate_limit_custom_rate_limiter(self):
+        """PDP accepts optional rate_limiter; check and record are called on rate limit checks."""
+        mock_limiter = MagicMock(spec=SlidingWindowRateLimiter)
+        from tiresias.auth.rate_limiter import RateLimitResult
+        mock_limiter.check.return_value = RateLimitResult(
+            allowed=True, current_count=0, limit=5, remaining=5,
+            reset_at=0.0, window_seconds=3600,
+        )
 
         policy = SOPPolicy(
             rules=[SOPRule(sop_id="SOP-001", allowed_actions=["generate_report"], rate_limit="5/hour")],
@@ -663,13 +666,13 @@ class TestRateLimitEnforcement:
         )
         loader = MagicMock()
         loader.load_sop_policy.return_value = policy
-        pdp = PolicyDecisionPoint(policy_loader=loader, execution_log=mock_log)
+        pdp = PolicyDecisionPoint(policy_loader=loader, rate_limiter=mock_limiter)
 
         pdp.evaluate_sop_compliance(
             identity="alfred", tenant="saluca", sop_id="SOP-001", action="generate_report"
         )
-        mock_log.count_since.assert_called_once()
-        mock_log.record.assert_called_once_with("alfred", "SOP-001", "generate_report")
+        mock_limiter.check.assert_called_once()
+        mock_limiter.record.assert_called_once_with("alfred:SOP-001:generate_report")
 
 
 class TestPersonaYAMLFiles:

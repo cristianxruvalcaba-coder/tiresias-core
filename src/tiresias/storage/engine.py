@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 from sqlalchemy import event, text
@@ -11,21 +12,52 @@ from tiresias.storage.schema import Base
 _engine_registry: dict[str, AsyncEngine] = {}
 _registry_lock = asyncio.Lock()
 
+DATABASE_URL = os.environ.get("TIRESIAS_DATABASE_URL")
 
-async def get_engine(tenant_id: str, data_root: Path) -> AsyncEngine:
+
+def _is_postgres() -> bool:
+    return bool(DATABASE_URL and DATABASE_URL.startswith("postgresql"))
+
+
+async def get_engine(tenant_id: str, data_root: Path = Path("/data")) -> AsyncEngine:
     """Return (or create and cache) the AsyncEngine for the given tenant.
 
-    The SQLite database is created lazily at:
+    If TIRESIAS_DATABASE_URL is set to a postgresql:// URL, a single shared
+    Postgres engine is used (tenants isolated by the tenant_id column).
+    Otherwise, falls back to per-tenant SQLite databases at:
         <data_root>/tenants/<tenant_id>/tiresias.db
-
-    WAL mode and recommended pragmas are set on every new connection.
     """
-    # Fast path — no lock needed once populated
+    if _is_postgres():
+        # Postgres mode: single shared engine
+        _key = "__pg__"
+        if _key in _engine_registry:
+            return _engine_registry[_key]
+
+        async with _registry_lock:
+            if _key in _engine_registry:
+                return _engine_registry[_key]
+
+            pg_url = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
+            engine = create_async_engine(
+                pg_url,
+                echo=False,
+                pool_size=10,
+                max_overflow=20,
+            )
+
+            # Tables are created externally (migration / init SQL).
+            # Run create_all only to pick up any new columns during dev.
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+
+            _engine_registry[_key] = engine
+            return engine
+
+    # ---------- SQLite per-tenant fallback ----------
     if tenant_id in _engine_registry:
         return _engine_registry[tenant_id]
 
     async with _registry_lock:
-        # Double-checked locking
         if tenant_id in _engine_registry:
             return _engine_registry[tenant_id]
 
@@ -49,7 +81,6 @@ async def get_engine(tenant_id: str, data_root: Path) -> AsyncEngine:
             cursor.execute("PRAGMA mmap_size=268435456")
             cursor.close()
 
-        # Create all tables on first access
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
 
