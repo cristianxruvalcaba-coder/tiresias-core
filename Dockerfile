@@ -35,8 +35,10 @@ RUN pip install --no-cache-dir /tmp/*.whl && rm /tmp/*.whl
 # Copy entrypoint
 COPY src/ src/
 
-# Non-root user
-RUN useradd -m -u 1000 tiresias && chown -R tiresias /app
+# Non-root user + data directories
+RUN useradd -m -u 1000 tiresias \
+    && mkdir -p /app/data/tenants \
+    && chown -R tiresias:tiresias /app
 USER tiresias
 
 # Default ports (overridable via env)

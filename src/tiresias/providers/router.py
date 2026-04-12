@@ -46,7 +46,13 @@ class ProviderRouter:
         last_exc: Exception | None = None
 
         for provider_name in ordered:
-            provider = self._builder(provider_name)
+            try:
+                provider = self._builder(provider_name)
+            except Exception as exc:
+                logger.warning("Provider %s failed to initialize: %s", provider_name, exc)
+                self._health.record_error(provider_name)
+                last_exc = exc
+                continue
             try:
                 url, provider_headers, provider_body = provider.format_request(request_body)
                 merged_headers = {**extra_headers, **provider_headers}

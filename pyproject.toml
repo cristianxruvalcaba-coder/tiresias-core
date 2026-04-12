@@ -20,6 +20,8 @@ dependencies = [
     "uvicorn>=0.30",
     "tiktoken>=0.7",
     "asyncpg>=0.29",
+    "structlog>=24.0",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]

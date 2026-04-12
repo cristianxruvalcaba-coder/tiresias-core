@@ -77,6 +77,9 @@ class TiresiasSettings(BaseSettings):
     gcp_project_id: str | None = Field(default=None, alias="TIRESIAS_GCP_PROJECT_ID")
     gcp_secret_id: str | None = Field(default=None, alias="TIRESIAS_GCP_SECRET_ID")
 
+    # Soul-svc identity resolution
+    soul_api_url: str | None = Field(default=None, alias="SOUL_API_URL")
+
     # Policy Decision Point (PDP)
     policy_enabled: bool = Field(default=False, alias="TIRESIAS_POLICY_ENABLED")
     policies_dir: str = Field(default="policies", alias="TIRESIAS_POLICIES_DIR")

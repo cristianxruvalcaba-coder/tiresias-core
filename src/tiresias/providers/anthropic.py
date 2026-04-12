@@ -49,6 +49,16 @@ class AnthropicProvider(BaseProvider):
             provider_body["stream"] = body["stream"]
         return url, headers, provider_body
 
+    def is_error(self, status_code: int) -> bool:
+        """Cascade on 5xx AND on specific 4xx codes that indicate the provider
+        cannot serve this request (unknown model, bad key, rate-limited)."""
+        if status_code >= 500:
+            return True
+        # 401: invalid API key -- cascade, another provider may have valid creds
+        # 404: model not found -- cascade, e.g. an Ollama model name was sent here
+        # 429: rate limited -- cascade to next provider
+        return status_code in (401, 404, 429)
+
     def parse_response(self, response_json: dict) -> dict:
         # Normalize Anthropic Messages response -> OpenAI chat completion format
         content_list = response_json.get("content", [])

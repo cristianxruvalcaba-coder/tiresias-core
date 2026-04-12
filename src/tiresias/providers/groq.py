@@ -21,7 +21,9 @@ class GroqProvider(BaseProvider):
     def format_request(self, body: dict) -> tuple[str, dict, dict]:
         # Groq uses OpenAI-compatible API at /openai/v1/chat/completions
         url = f"{self._api_base}/openai/v1/chat/completions"
-        headers = {"Authorization": f"Bearer {self._api_key}"}
+        headers: dict[str, str] = {}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
         return url, headers, dict(body)
 
     def parse_response(self, response_json: dict) -> dict:
