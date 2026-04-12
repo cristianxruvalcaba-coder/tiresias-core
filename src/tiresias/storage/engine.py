@@ -105,7 +105,10 @@ async def set_tenant_context(session: "AsyncSession", tenant_id: str) -> None:  
     import re
     if not re.fullmatch(r"[0-9a-fA-F\-]{36}", tenant_id):
         raise ValueError(f"Invalid tenant_id format: {tenant_id!r}")
-    await session.execute(text(f"SET LOCAL app.current_tenant_id = '{tenant_id}'"))
+    # Use SET (not SET LOCAL) to persist the variable for the connection duration.
+    # SET LOCAL is transaction-scoped and is lost between autocommit statements.
+    # The variable must be visible when RLS policies evaluate during INSERT/SELECT.
+    await session.execute(text(f"SET app.current_tenant_id = '{tenant_id}'"))
 
 
 async def close_all_engines() -> None:
