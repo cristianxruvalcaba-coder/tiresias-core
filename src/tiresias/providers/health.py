@@ -75,3 +75,4 @@ class HealthTracker:
         if name not in self._state:
             self._state[name] = ProviderHealth(name=name)
         return self._state[name]
+

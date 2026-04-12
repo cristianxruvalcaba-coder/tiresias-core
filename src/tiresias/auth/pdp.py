@@ -1,38 +1,55 @@
 """Policy Decision Point -- evaluates SOP compliance."""
 from __future__ import annotations
 
+import re
 import structlog
 import uuid
-from datetime import datetime, timezone
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from tiresias.auth.rate_limiter import SlidingWindowRateLimiter, parse_rate_limit
-from tiresias.auth.spend_tracker import SpendTracker
 from tiresias.policy.sop_policy import SOPDecision, SOPPolicy, SOPRule
 from tiresias.audit.logger import AuditLogger
 
 logger = structlog.get_logger(__name__)
 
 
+class ExecutionLog:
+    """Interface for tracking SOP action executions for rate limiting."""
+
+    def record(self, identity: str, sop_id: str, action: str) -> None:
+        """Record an execution event."""
+        raise NotImplementedError
+
+    def count_since(self, identity: str, sop_id: str, action: str, since: datetime) -> int:
+        """Count executions since the given timestamp."""
+        raise NotImplementedError
+
+
+class InMemoryExecutionLog(ExecutionLog):
+    """In-memory execution log for rate limiting. Suitable for single-process deployments."""
+
+    def __init__(self):
+        self._log: dict[str, list[datetime]] = defaultdict(list)
+
+    def _key(self, identity: str, sop_id: str, action: str) -> str:
+        return f"{identity}:{sop_id}:{action}"
+
+    def record(self, identity: str, sop_id: str, action: str) -> None:
+        self._log[self._key(identity, sop_id, action)].append(datetime.now(timezone.utc))
+
+    def count_since(self, identity: str, sop_id: str, action: str, since: datetime) -> int:
+        key = self._key(identity, sop_id, action)
+        return sum(1 for ts in self._log[key] if ts >= since)
+
+
 class PolicyDecisionPoint:
-    """Evaluates agent SOP compliance against persona policies.
+    """Evaluates agent SOP compliance against persona policies."""
 
-    Uses a :class:`SlidingWindowRateLimiter` for per-key sliding window rate
-    limiting and a :class:`SpendTracker` for cumulative spend enforcement.
-    Both are thread-safe and suitable for single-process async deployments.
-    """
-
-    def __init__(
-        self,
-        policy_loader=None,
-        audit_logger: AuditLogger | None = None,
-        rate_limiter: SlidingWindowRateLimiter | None = None,
-        spend_tracker: SpendTracker | None = None,
-    ):
+    def __init__(self, policy_loader=None, audit_logger: AuditLogger | None = None, execution_log: ExecutionLog | None = None):
         self.policy_loader = policy_loader
         self.audit = audit_logger or AuditLogger()
-        self.rate_limiter = rate_limiter or SlidingWindowRateLimiter()
-        self.spend_tracker = spend_tracker or SpendTracker()
+        self.execution_log = execution_log or InMemoryExecutionLog()
 
     def evaluate_sop_compliance(
         self,
@@ -49,7 +66,7 @@ class PolicyDecisionPoint:
         2. Load policy from persona YAML
         3. Extract sop_policies section
         4. Find matching SOPRule for (sop_id, action)
-        5. Check conditions -- rate limit first (cheapest), then spend, then time window
+        5. Check conditions (time_window, rate_limit, max_spend)
         6. Return SOPDecision with audit trail
         """
         context = context or {}
@@ -65,8 +82,8 @@ class PolicyDecisionPoint:
         # Step 2: Load policy
         sop_policy = self._load_sop_policy(identity, tenant)
 
-        # Step 3-4: Find matching rule (pass context for model_pattern checks)
-        rule = sop_policy.find_matching_rule(sop_id, action, context=context)
+        # Step 3-4: Find matching rule
+        rule = sop_policy.find_matching_rule(sop_id, action)
 
         if rule is None:
             # No matching rule -- use default action
@@ -88,6 +105,7 @@ class PolicyDecisionPoint:
                     approval_id=generated_approval_id,
                 )
             else:
+                # default is deny (or advisory enforcement with no match still denies by default_action)
                 audit_ref = self.audit.log_event("sop_deny", {
                     "identity": identity,
                     "sop_id": sop_id,
@@ -102,86 +120,8 @@ class PolicyDecisionPoint:
                     audit_ref=audit_ref,
                 )
 
-        # Step 5: Check conditions (ordered by cost: cheapest first)
-
-        # --- Rate limit (O(1) dict lookup + deque scan) ---
-        if rule.rate_limit:
-            parsed = parse_rate_limit(rule.rate_limit)
-            if parsed is None:
-                logger.warning("rate_limit_parse_failed", limit=rule.rate_limit, identity=identity)
-            else:
-                limit, window_seconds = parsed
-                rl_key = f"{identity}:{sop_id}:{action}"
-                rl_result = self.rate_limiter.check(rl_key, limit, window_seconds)
-                if not rl_result.allowed:
-                    logger.info(
-                        "rate_limit_exceeded",
-                        identity=identity, sop_id=sop_id, action=action,
-                        limit=rule.rate_limit, current_count=rl_result.current_count,
-                    )
-                    audit_ref = self.audit.log_event("sop_deny", {
-                        "identity": identity,
-                        "sop_id": sop_id,
-                        "action": action,
-                        "reason": f"rate limit exceeded: {rule.rate_limit}",
-                        "current_count": rl_result.current_count,
-                        "remaining": rl_result.remaining,
-                    })
-                    return SOPDecision(
-                        decision="deny",
-                        sop_id=sop_id,
-                        action=action,
-                        reason=f"Rate limit exceeded: {rule.rate_limit} ({rl_result.current_count}/{rl_result.limit} used)",
-                        audit_ref=audit_ref,
-                    )
-
-        # --- Spend budget (O(1) dict lookup) ---
-        if rule.max_spend_usd is not None:
-            spend_key = f"{identity}:{sop_id}"
-            budget = self.spend_tracker.check_budget(spend_key, rule.max_spend_usd)
-            if not budget.allowed:
-                logger.info(
-                    "spend_budget_exceeded",
-                    identity=identity, sop_id=sop_id,
-                    current_spend=budget.current_spend_usd, max_spend=rule.max_spend_usd,
-                )
-                audit_ref = self.audit.log_event("sop_deny", {
-                    "identity": identity,
-                    "sop_id": sop_id,
-                    "action": action,
-                    "reason": f"spend budget exceeded: ${budget.current_spend_usd:.4f} >= ${rule.max_spend_usd:.2f}",
-                })
-                return SOPDecision(
-                    decision="deny",
-                    sop_id=sop_id,
-                    action=action,
-                    reason=f"Spend budget exceeded: ${budget.current_spend_usd:.4f} of ${rule.max_spend_usd:.2f} used",
-                    audit_ref=audit_ref,
-                )
-            # Check that this single request would not blow the remaining budget
-            estimated_cost = context.get("estimated_cost_usd", 0.0)
-            if estimated_cost > 0 and budget.current_spend_usd + estimated_cost > rule.max_spend_usd:
-                audit_ref = self.audit.log_event("sop_deny", {
-                    "identity": identity,
-                    "sop_id": sop_id,
-                    "action": action,
-                    "reason": (
-                        f"estimated cost ${estimated_cost:.4f} would exceed budget "
-                        f"(${budget.current_spend_usd:.4f} + ${estimated_cost:.4f} > ${rule.max_spend_usd:.2f})"
-                    ),
-                })
-                return SOPDecision(
-                    decision="deny",
-                    sop_id=sop_id,
-                    action=action,
-                    reason=(
-                        f"Estimated cost ${estimated_cost:.4f} would exceed remaining budget "
-                        f"${budget.remaining_usd:.4f} of ${rule.max_spend_usd:.2f}"
-                    ),
-                    audit_ref=audit_ref,
-                )
-
-        # --- Time window (string parse + comparison) ---
+        # Step 5: Check conditions
+        # Time window check
         if rule.time_window:
             if not self._check_time_window(rule.time_window):
                 audit_ref = self.audit.log_event("sop_deny", {
@@ -195,6 +135,41 @@ class PolicyDecisionPoint:
                     sop_id=sop_id,
                     action=action,
                     reason=f"Action not allowed outside time window {rule.time_window}",
+                    audit_ref=audit_ref,
+                )
+
+        # Rate limit check
+        if rule.rate_limit:
+            if not self._check_rate_limit(identity, sop_id, action, rule.rate_limit):
+                audit_ref = self.audit.log_event("sop_deny", {
+                    "identity": identity,
+                    "sop_id": sop_id,
+                    "action": action,
+                    "reason": f"rate limit exceeded: {rule.rate_limit}",
+                })
+                return SOPDecision(
+                    decision="deny",
+                    sop_id=sop_id,
+                    action=action,
+                    reason=f"Rate limit exceeded: {rule.rate_limit}",
+                    audit_ref=audit_ref,
+                )
+
+        # Max spend check
+        if rule.max_spend_usd is not None:
+            estimated_cost = context.get("estimated_cost_usd", 0.0)
+            if estimated_cost > rule.max_spend_usd:
+                audit_ref = self.audit.log_event("sop_deny", {
+                    "identity": identity,
+                    "sop_id": sop_id,
+                    "action": action,
+                    "reason": f"estimated cost ${estimated_cost} exceeds max ${rule.max_spend_usd}",
+                })
+                return SOPDecision(
+                    decision="deny",
+                    sop_id=sop_id,
+                    action=action,
+                    reason=f"Estimated cost ${estimated_cost} exceeds limit ${rule.max_spend_usd}",
                     audit_ref=audit_ref,
                 )
 
@@ -222,16 +197,13 @@ class PolicyDecisionPoint:
         if sop_policy.enforcement == "advisory":
             logger.warning("sop_advisory_grant", identity=identity, sop_id=sop_id, action=action)
 
-        # Record for rate limiting (after grant, before returning)
-        rl_key = f"{identity}:{sop_id}:{action}"
-        self.rate_limiter.record(rl_key)
-
         audit_ref = self.audit.log_event("sop_grant", {
             "identity": identity,
             "sop_id": sop_id,
             "action": action,
             "reason": "rule match, no approval required",
         })
+        self.execution_log.record(identity, sop_id, action)
         return SOPDecision(
             decision="grant",
             sop_id=sop_id,
@@ -239,15 +211,6 @@ class PolicyDecisionPoint:
             reason="SOP action authorized by policy rule",
             audit_ref=audit_ref,
         )
-
-    def record_spend(self, identity: str, sop_id: str, amount_usd: float) -> None:
-        """Record spend after a completed LLM request.
-
-        Call from the proxy request handler once the upstream response returns
-        with actual token counts / cost.
-        """
-        key = f"{identity}:{sop_id}"
-        self.spend_tracker.record_spend(key, amount_usd)
 
     def _load_sop_policy(self, identity: str, tenant: str) -> SOPPolicy:
         """Load SOPPolicy from persona YAML via policy loader."""
@@ -272,3 +235,34 @@ class PolicyDecisionPoint:
                 return current_minutes >= start_minutes or current_minutes <= end_minutes
         except Exception:
             return True  # Fail open on parse error
+
+    @staticmethod
+    def _parse_rate_limit(limit: str) -> tuple[int, int] | None:
+        """Parse rate limit string like '1/day', '5/hour', '10/minute'.
+
+        Returns (max_count, window_seconds) or None if unparseable.
+        """
+        match = re.match(r'^(\d+)/(day|hour|minute)$', limit)
+        if not match:
+            return None
+        count = int(match.group(1))
+        period = match.group(2)
+        seconds = {"day": 86400, "hour": 3600, "minute": 60}[period]
+        return (count, seconds)
+
+    def _check_rate_limit(self, identity: str, sop_id: str, action: str, limit: str) -> bool:
+        """Check rate limit (e.g. '1/day', '5/hour').
+
+        Returns False if limit exceeded, True if within limit.
+        Fails open on parse errors (returns True).
+        """
+        parsed = self._parse_rate_limit(limit)
+        if parsed is None:
+            logger.warning("rate_limit_parse_failed", limit=limit, identity=identity)
+            return True  # Fail open on unparseable limit
+
+        max_count, window_seconds = parsed
+        since = datetime.now(timezone.utc) - timedelta(seconds=window_seconds)
+        current_count = self.execution_log.count_since(identity, sop_id, action, since)
+        return current_count < max_count
+

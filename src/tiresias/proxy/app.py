@@ -10,17 +10,17 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tiresias.auth.pdp import PolicyDecisionPoint
 from tiresias.bootstrap import first_boot
 from tiresias.config import TiresiasSettings, parse_providers
 from tiresias.encryption.envelope import EnvelopeEncryption
 from tiresias.encryption.providers import resolve_kek_provider
-from tiresias.policy.loader import DirectoryPolicyLoader
 from tiresias.proxy.interceptor import record_error_turn, record_turn
+from tiresias.proxy.rate_limit import RateLimitMiddleware
+from tiresias.proxy.saas_auth import SaaSAuthMiddleware
 from tiresias.providers import build_provider
 from tiresias.providers.health import HealthTracker
 from tiresias.providers.router import ProviderCascadeExhausted, ProviderRouter
-from tiresias.storage.engine import get_engine
+from tiresias.storage.engine import get_engine, set_tenant_context
 from tiresias.tracking.sessions import parse_session_id
 
 logger = logging.getLogger(__name__)
@@ -30,7 +30,6 @@ _envelope: EnvelopeEncryption | None = None
 _http_client: httpx.AsyncClient | None = None
 _router: ProviderRouter | None = None
 _health: HealthTracker | None = None
-_pdp: PolicyDecisionPoint | None = None
 
 
 def get_settings() -> TiresiasSettings:
@@ -63,8 +62,14 @@ def get_health() -> HealthTracker:
     return _health
 
 
-def get_pdp() -> PolicyDecisionPoint | None:
-    return _pdp
+def _resolve_tenant_id(request: Request | None = None) -> str:
+    """Resolve tenant_id: from request state in SaaS mode, from config otherwise."""
+    cfg = get_settings()
+    if cfg.mode == "saas" and request is not None:
+        tid = getattr(request.state, "tenant_id", None)
+        if tid:
+            return tid
+    return cfg.tenant_id
 
 
 def _detect_provider(upstream_url: str) -> str:
@@ -77,15 +82,35 @@ def _detect_provider(upstream_url: str) -> str:
     return "openai"
 
 
+def _resolve_provider_for_model(model: str, cfg: TiresiasSettings):
+    """If the model name has a provider prefix matching a configured provider,
+    build and return that provider instance.  Otherwise return None."""
+    if "/" not in model:
+        return None
+    prefix = model.split("/", 1)[0].lower()
+    cascade = parse_providers(cfg.providers)
+    if prefix not in cascade:
+        return None
+    return build_provider(prefix, dict(os.environ))
+
+
 def _build_router(
     cfg: TiresiasSettings, http_client: httpx.AsyncClient
 ) -> tuple[ProviderRouter, HealthTracker]:
     cascade = parse_providers(cfg.providers)
     health = HealthTracker(cascade)
 
+    # Only use the upstream_url override when it was explicitly set (i.e. not
+    # the default OpenAI URL) AND the single provider matches the URL.
+    # Without this guard, TIRESIAS_PROVIDERS=anthropic + the default
+    # upstream_url=https://api.openai.com would send Anthropic requests to
+    # OpenAI's domain, resulting in 404.
     single_provider_base: str | None = None
     if len(cascade) == 1:
-        single_provider_base = cfg.upstream_url.rstrip("/")
+        upstream = cfg.upstream_url.rstrip("/")
+        detected = _detect_provider(upstream)
+        if detected == cascade[0]:
+            single_provider_base = upstream
 
     def builder(name: str):
         base = single_provider_base if (single_provider_base and len(cascade) == 1) else None
@@ -103,33 +128,31 @@ def _build_router(
 def create_app(settings: TiresiasSettings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        global _settings, _envelope, _http_client, _router, _health, _pdp
+        global _settings, _envelope, _http_client, _router, _health
         cfg = settings or TiresiasSettings()
         _settings = cfg
         provider = resolve_kek_provider(cfg)
         _envelope = EnvelopeEncryption(provider)
         _http_client = httpx.AsyncClient(timeout=httpx.Timeout(300.0))
         _router, _health = _build_router(cfg, _http_client)
-
-        # PDP initialization (only when policy_enabled)
-        if cfg.policy_enabled:
-            loader = DirectoryPolicyLoader(policies_dir=cfg.policies_dir)
-            _pdp = PolicyDecisionPoint(policy_loader=loader)
-            logger.info(
-                "PDP enabled (enforcement=%s, policies_dir=%s)",
-                cfg.policy_enforcement_mode,
-                cfg.policies_dir,
-            )
-
-        engine = await get_engine(cfg.tenant_id, cfg.data_root)
-        async with AsyncSession(engine) as session:
-            api_key = await first_boot(cfg.tenant_id, cfg, session)
-            if api_key:
-                logger.info("First boot complete. Tenant: %s", cfg.tenant_id)
+        if cfg.mode == "saas":
+            # SaaS mode: shared multi-tenant, no first_boot needed.
+            # Tenant resolution happens per-request via SaaSAuthMiddleware.
+            # Still need an engine for the shared DB.
+            if cfg.database_url:
+                engine = await get_engine("__saas__", cfg.data_root)
+            logger.info("Tiresias proxy started in SaaS mode")
+        else:
+            # Dedicated / on-prem: single tenant, run first_boot
+            engine = await get_engine(cfg.tenant_id, cfg.data_root)
+            async with AsyncSession(engine) as session:
+                api_key = await first_boot(cfg.tenant_id, cfg, session)
+                if api_key:
+                    logger.info("First boot complete. Tenant: %s", cfg.tenant_id)
         cascade = parse_providers(cfg.providers)
         logger.info(
-            "Tiresias proxy started. Tenant: %s, Providers: %s",
-            cfg.tenant_id,
+            "Tiresias proxy started. Mode: %s, Providers: %s",
+            cfg.mode,
             cascade,
         )
         yield
@@ -139,19 +162,43 @@ def create_app(settings: TiresiasSettings | None = None) -> FastAPI:
     app = FastAPI(
         title="Tiresias Proxy",
         description="OpenAI-compatible proxy with encrypted audit logging",
-        version="0.5.0",
+        version="0.6.0",
         lifespan=lifespan,
+    )
+
+    # SaaS auth middleware — resolves tenant from API key per-request in SaaS mode,
+    # no-op in dedicated/onprem modes.
+    _cfg_for_middleware = settings or TiresiasSettings()
+
+    async def _saas_engine_factory():
+        return await get_engine("__saas__", _cfg_for_middleware.data_root)
+
+    # Middleware execution order (Starlette LIFO: last-added = outermost = runs first):
+    #   1. SaaSAuthMiddleware (outer) — resolves tenant_id from API key
+    #   2. RateLimitMiddleware (inner) — checks RPM against resolved tenant
+    # Add rate limit FIRST, then auth SECOND so auth wraps rate limit.
+    app.add_middleware(
+        RateLimitMiddleware,
+        settings=_cfg_for_middleware,
+        redis_url=_cfg_for_middleware.redis_url,
+    )
+
+    app.add_middleware(
+        SaaSAuthMiddleware,
+        settings=_cfg_for_middleware,
+        engine_factory=_saas_engine_factory,
     )
 
     @app.get("/health")
     async def health() -> dict:
-        return {"status": "ok", "service": "tiresias-proxy"}
+        return {"status": "ok", "service": "tiresias-proxy", "mode": _cfg_for_middleware.mode}
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Response:
         cfg = get_settings()
         envelope = get_envelope()
         router = get_router()
+        tenant_id = _resolve_tenant_id(request)
         try:
             body = await request.json()
         except Exception:
@@ -163,96 +210,29 @@ def create_app(settings: TiresiasSettings | None = None) -> FastAPI:
         upstream_headers = {
             k: v
             for k, v in request.headers.items()
-            if k.lower() not in ("host", "content-length", "transfer-encoding")
+            if k.lower() not in ("host", "content-length", "transfer-encoding", "x-tiresias-api-key")
         }
 
-        # ---- PDP policy check ----
-        pdp = get_pdp()
-        policy_decision = None
-        if pdp is not None:
-            user_id = (
-                request.headers.get("x-tiresias-user-id") or cfg.tenant_id
-            )
-            sop_context = {
-                "model": model,
-                "estimated_cost_usd": 0.0,  # real cost unknown pre-call
-                "action": "chat_completion",
-            }
-            policy_decision = pdp.evaluate_sop_compliance(
-                identity=user_id,
-                tenant=cfg.tenant_id,
-                sop_id="model-access",
-                action="chat_completion",
-                context=sop_context,
-            )
-            # Also check model-specific rules (e.g. "expensive-models")
-            model_decision = pdp.evaluate_sop_compliance(
-                identity=user_id,
-                tenant=cfg.tenant_id,
-                sop_id="expensive-models",
-                action="chat_completion",
-                context=sop_context,
-            )
-            # If the model-specific rule matched and is more restrictive, use it
-            if model_decision.decision != "deny" or policy_decision.decision == "deny":
-                # model_decision matched a rule (not default-deny) -- prefer it
-                if model_decision.sop_id == "expensive-models" and model_decision.decision != "deny":
-                    policy_decision = model_decision
-            advisory = cfg.policy_enforcement_mode == "advisory"
-            if advisory:
-                logger.info(
-                    "PDP advisory: decision=%s reason=%s",
-                    policy_decision.decision,
-                    policy_decision.reason,
-                )
-            else:
-                if policy_decision.decision == "deny":
-                    # Attach to metadata for audit
-                    if extra_metadata is None:
-                        extra_metadata = {}
-                    extra_metadata["policy_decision"] = policy_decision.model_dump()
-                    return Response(
-                        content=json.dumps({
-                            "error": {
-                                "message": f"Policy denied: {policy_decision.reason}",
-                                "type": "policy_error",
-                                "code": "policy_denied",
-                                "sop_id": policy_decision.sop_id,
-                                "audit_ref": policy_decision.audit_ref,
-                            }
-                        }),
-                        status_code=403,
-                        media_type="application/json",
-                    )
-                elif policy_decision.decision == "queue_for_approval":
-                    return Response(
-                        content=json.dumps({
-                            "status": "queued_for_approval",
-                            "approval_id": policy_decision.approval_id,
-                            "reason": policy_decision.reason,
-                            "sop_id": policy_decision.sop_id,
-                            "audit_ref": policy_decision.audit_ref,
-                        }),
-                        status_code=202,
-                        media_type="application/json",
-                    )
-            # Attach decision to metadata for audit trail
-            if extra_metadata is None:
-                extra_metadata = {}
-            extra_metadata["policy_decision"] = policy_decision.model_dump()
-        # ---- end PDP check ----
-
         if is_streaming:
-            upstream_url = cfg.upstream_url.rstrip("/")
-            target_url = f"{upstream_url}/v1/chat/completions"
-            upstream_provider = _detect_provider(upstream_url)
+            # Model-prefix routing: if the model has a known provider prefix
+            # (e.g. ollama/llama3.1:8b), use that provider's URL directly.
+            resolved_provider = _resolve_provider_for_model(model, cfg)
+            if resolved_provider:
+                target_url, provider_headers, stream_body = resolved_provider.format_request(body)
+                upstream_headers.update(provider_headers)
+                upstream_provider = resolved_provider.name
+            else:
+                upstream_url = cfg.upstream_url.rstrip("/")
+                target_url = f"{upstream_url}/v1/chat/completions"
+                upstream_provider = _detect_provider(upstream_url)
+                stream_body = body
             client = get_http_client()
             return await _handle_streaming(
                 client=client,
                 target_url=target_url,
                 upstream_headers=upstream_headers,
-                body=body,
-                tenant_id=cfg.tenant_id,
+                body=stream_body,
+                tenant_id=tenant_id,
                 model=model,
                 provider=upstream_provider,
                 session_id=session_id,
@@ -265,7 +245,7 @@ def create_app(settings: TiresiasSettings | None = None) -> FastAPI:
                 router=router,
                 upstream_headers=upstream_headers,
                 body=body,
-                tenant_id=cfg.tenant_id,
+                tenant_id=tenant_id,
                 model=model,
                 session_id=session_id,
                 extra_metadata=extra_metadata,
@@ -276,22 +256,26 @@ def create_app(settings: TiresiasSettings | None = None) -> FastAPI:
     @app.post("/v1/sessions/{session_id}/tag")
     async def tag_session_endpoint(session_id: str, request: Request) -> dict:
         cfg = get_settings()
+        tenant_id = _resolve_tenant_id(request)
         try:
             metadata = await request.json()
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid JSON body")
-        engine = await get_engine(cfg.tenant_id, cfg.data_root)
+        engine = await get_engine(tenant_id, cfg.data_root)
         async with AsyncSession(engine) as db_session:
+            await set_tenant_context(db_session, tenant_id)
             from tiresias.tracking.sessions import tag_session
 
             updated = await tag_session(session_id, metadata, db_session)
         return {"session_id": session_id, "rows_updated": updated}
 
     @app.get("/v1/sessions/{session_id}")
-    async def get_session(session_id: str) -> dict:
+    async def get_session(session_id: str, request: Request) -> dict:
         cfg = get_settings()
-        engine = await get_engine(cfg.tenant_id, cfg.data_root)
+        tenant_id = _resolve_tenant_id(request)
+        engine = await get_engine(tenant_id, cfg.data_root)
         async with AsyncSession(engine) as db_session:
+            await set_tenant_context(db_session, tenant_id)
             from tiresias.tracking.sessions import get_session_stats
 
             stats = await get_session_stats(session_id, db_session)
@@ -319,6 +303,12 @@ def create_app(settings: TiresiasSettings | None = None) -> FastAPI:
         return {"cascade": cascade, "reloaded": True}
 
     # -------------------------------------------------------------------------
+    # Dashboard routes — mounted BEFORE catch-all to avoid path conflicts
+    # -------------------------------------------------------------------------
+    from tiresias.dashboard.router import router as dashboard_router
+    app.include_router(dashboard_router)
+
+    # -------------------------------------------------------------------------
     # Phase 5: Generic API proxy routes (APIP-01 to APIP-04)
     # -------------------------------------------------------------------------
 
@@ -333,19 +323,21 @@ def create_app(settings: TiresiasSettings | None = None) -> FastAPI:
         Activated when TIRESIAS_GENERIC_PROXY_MODE=true OR always available at /api/.
         """
         cfg = get_settings()
+        tenant_id = _resolve_tenant_id(request)
         client = get_http_client()
         body_bytes = await request.body()
         params = dict(request.query_params)
         upstream_headers = {
             k: v
             for k, v in request.headers.items()
-            if k.lower() not in ("host", "content-length", "transfer-encoding")
+            if k.lower() not in ("host", "content-length", "transfer-encoding", "x-tiresias-api-key")
         }
 
         from tiresias.proxy.generic import forward_generic_request
 
-        engine = await get_engine(cfg.tenant_id, cfg.data_root)
+        engine = await get_engine(tenant_id, cfg.data_root)
         async with AsyncSession(engine) as db_session:
+            await set_tenant_context(db_session, tenant_id)
             try:
                 upstream_resp = await forward_generic_request(
                     client=client,
@@ -356,7 +348,7 @@ def create_app(settings: TiresiasSettings | None = None) -> FastAPI:
                     headers=upstream_headers,
                     body_bytes=body_bytes,
                     params=params,
-                    tenant_id=cfg.tenant_id,
+                    tenant_id=tenant_id,
                     db_session=db_session,
                 )
             except httpx.RequestError as exc:
@@ -378,51 +370,59 @@ def create_app(settings: TiresiasSettings | None = None) -> FastAPI:
     # -------------------------------------------------------------------------
 
     @app.get("/v1/analytics/api/endpoints")
-    async def analytics_api_endpoints(hours: int = 24, api_service: str | None = None) -> dict:
+    async def analytics_api_endpoints(request: Request, hours: int = 24, api_service: str | None = None) -> dict:
         """Per-endpoint metrics: volume, avg latency, error rate (APIP-02/03/04)."""
         cfg = get_settings()
-        engine = await get_engine(cfg.tenant_id, cfg.data_root)
+        tenant_id = _resolve_tenant_id(request)
+        engine = await get_engine(tenant_id, cfg.data_root)
         async with AsyncSession(engine) as db_session:
+            await set_tenant_context(db_session, tenant_id)
             from tiresias.analytics.api_telemetry import get_endpoint_metrics
 
             endpoints = await get_endpoint_metrics(
-                cfg.tenant_id, db_session, hours=hours, api_service=api_service
+                tenant_id, db_session, hours=hours, api_service=api_service
             )
-        return {"tenant_id": cfg.tenant_id, "window_hours": hours, "endpoints": endpoints}
+        return {"tenant_id": tenant_id, "window_hours": hours, "endpoints": endpoints}
 
     @app.get("/v1/analytics/api/costs")
-    async def analytics_api_costs(hours: int = 24) -> dict:
+    async def analytics_api_costs(request: Request, hours: int = 24) -> dict:
         """Cost by endpoint/service (APIP-05)."""
         cfg = get_settings()
-        engine = await get_engine(cfg.tenant_id, cfg.data_root)
+        tenant_id = _resolve_tenant_id(request)
+        engine = await get_engine(tenant_id, cfg.data_root)
         async with AsyncSession(engine) as db_session:
+            await set_tenant_context(db_session, tenant_id)
             from tiresias.analytics.api_telemetry import get_cost_by_endpoint
 
-            costs = await get_cost_by_endpoint(cfg.tenant_id, db_session, hours=hours)
-        return {"tenant_id": cfg.tenant_id, "window_hours": hours, "costs": costs}
+            costs = await get_cost_by_endpoint(tenant_id, db_session, hours=hours)
+        return {"tenant_id": tenant_id, "window_hours": hours, "costs": costs}
 
     @app.get("/v1/analytics/api/errors")
-    async def analytics_api_errors(hours: int = 24, api_service: str | None = None) -> dict:
+    async def analytics_api_errors(request: Request, hours: int = 24, api_service: str | None = None) -> dict:
         """Error breakdown by path_pattern and status code (APIP-04)."""
         cfg = get_settings()
-        engine = await get_engine(cfg.tenant_id, cfg.data_root)
+        tenant_id = _resolve_tenant_id(request)
+        engine = await get_engine(tenant_id, cfg.data_root)
         async with AsyncSession(engine) as db_session:
+            await set_tenant_context(db_session, tenant_id)
             from tiresias.analytics.api_telemetry import get_error_breakdown
 
             errors = await get_error_breakdown(
-                cfg.tenant_id, db_session, hours=hours, api_service=api_service
+                tenant_id, db_session, hours=hours, api_service=api_service
             )
-        return {"tenant_id": cfg.tenant_id, "window_hours": hours, "errors": errors}
+        return {"tenant_id": tenant_id, "window_hours": hours, "errors": errors}
 
     @app.get("/v1/analytics/unified")
-    async def analytics_unified(hours: int = 24) -> dict:
+    async def analytics_unified(request: Request, hours: int = 24) -> dict:
         """Unified LLM + API telemetry in single pane (APIP-06)."""
         cfg = get_settings()
-        engine = await get_engine(cfg.tenant_id, cfg.data_root)
+        tenant_id = _resolve_tenant_id(request)
+        engine = await get_engine(tenant_id, cfg.data_root)
         async with AsyncSession(engine) as db_session:
+            await set_tenant_context(db_session, tenant_id)
             from tiresias.analytics.unified import get_unified_analytics
 
-            data = await get_unified_analytics(cfg.tenant_id, db_session, hours=hours)
+            data = await get_unified_analytics(tenant_id, db_session, hours=hours)
         return data
 
     @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
@@ -472,35 +472,51 @@ async def _handle_non_streaming_router(
     settings,
 ):
     from sqlalchemy.ext.asyncio import AsyncSession as _AS
-    from tiresias.storage.engine import get_engine as _get_engine
+    from tiresias.storage.engine import get_engine as _get_engine, set_tenant_context as _stc
     import json as _json
+    import time as _time
 
+    _t0 = _time.monotonic()
     try:
         response_json, provider_name = await router.execute(body, upstream_headers)
     except ProviderCascadeExhausted as exc:
         engine = await _get_engine(tenant_id, settings.data_root)
         async with _AS(engine) as db_session:
+            await _stc(db_session, tenant_id)
             await record_error_turn(tenant_id, model, db_session)
         raise HTTPException(status_code=502, detail=str(exc))
+    except HTTPException:
+        # Re-raise provider client errors (4xx) with their original status code
+        raise
     except Exception as exc:
         engine = await _get_engine(tenant_id, settings.data_root)
         async with _AS(engine) as db_session:
+            await _stc(db_session, tenant_id)
             await record_error_turn(tenant_id, model, db_session)
         raise HTTPException(status_code=502, detail=str(exc))
 
-    engine = await _get_engine(tenant_id, settings.data_root)
-    async with _AS(engine) as db_session:
-        await record_turn(
-            tenant_id=tenant_id,
-            model=model,
-            provider=provider_name,
-            request_body=body,
-            response_body=response_json,
-            session_id=session_id,
-            metadata=extra_metadata,
-            envelope=envelope,
-            db_session=db_session,
-        )
+    _latency_ms = round((_time.monotonic() - _t0) * 1000)
+    _merged_meta = dict(extra_metadata) if extra_metadata else {}
+    _merged_meta["latency_ms"] = _latency_ms
+    _merged_meta["status_code"] = 200
+
+    try:
+        engine = await _get_engine(tenant_id, settings.data_root)
+        async with _AS(engine) as db_session:
+            await _stc(db_session, tenant_id)
+            await record_turn(
+                tenant_id=tenant_id,
+                model=model,
+                provider=provider_name,
+                request_body=body,
+                response_body=response_json,
+                session_id=session_id,
+                metadata=_merged_meta,
+                envelope=envelope,
+                db_session=db_session,
+            )
+    except Exception as audit_exc:
+        logger.warning("Audit record_turn failed (non-fatal): %s", audit_exc)
 
     response_bytes = _json.dumps(response_json).encode()
     return Response(
@@ -524,13 +540,14 @@ async def _handle_non_streaming(
     settings,
 ):
     from sqlalchemy.ext.asyncio import AsyncSession as _AS
-    from tiresias.storage.engine import get_engine as _get_engine
+    from tiresias.storage.engine import get_engine as _get_engine, set_tenant_context as _stc
 
     try:
         upstream_resp = await client.post(target_url, headers=upstream_headers, json=body)
     except Exception as exc:
         engine = await _get_engine(tenant_id, settings.data_root)
         async with _AS(engine) as db_session:
+            await _stc(db_session, tenant_id)
             await record_error_turn(tenant_id, model, db_session)
         raise HTTPException(status_code=502, detail=str(exc))
 
@@ -543,22 +560,27 @@ async def _handle_non_streaming(
             response_json = upstream_resp.json()
         except Exception:
             response_json = {}
-        engine = await _get_engine(tenant_id, settings.data_root)
-        async with _AS(engine) as db_session:
-            await record_turn(
-                tenant_id=tenant_id,
-                model=model,
-                provider=provider,
-                request_body=body,
-                response_body=response_json,
-                session_id=session_id,
-                metadata=extra_metadata,
-                envelope=envelope,
-                db_session=db_session,
-            )
+        try:
+            engine = await _get_engine(tenant_id, settings.data_root)
+            async with _AS(engine) as db_session:
+                await _stc(db_session, tenant_id)
+                await record_turn(
+                    tenant_id=tenant_id,
+                    model=model,
+                    provider=provider,
+                    request_body=body,
+                    response_body=response_json,
+                    session_id=session_id,
+                    metadata=extra_metadata,
+                    envelope=envelope,
+                    db_session=db_session,
+                )
+        except Exception as audit_exc:
+            logger.warning("Audit record_turn failed (non-fatal): %s", audit_exc)
     else:
         engine = await _get_engine(tenant_id, settings.data_root)
         async with _AS(engine) as db_session:
+            await _stc(db_session, tenant_id)
             await record_error_turn(tenant_id, model, db_session)
 
     for h in ("transfer-encoding", "content-encoding", "content-length"):
@@ -586,7 +608,9 @@ async def _handle_streaming(
     settings,
 ):
     import json as _json
+    import time as _time2
 
+    _t0_stream = _time2.monotonic()
     accumulated_chunks = []
     accumulated_response = {}
 
@@ -611,12 +635,17 @@ async def _handle_streaming(
         full_text = "".join(accumulated_chunks)
         assembled = _assemble_sse_response(full_text, model)
         accumulated_response.update(assembled)
+        _latency_ms_stream = round((_time2.monotonic() - _t0_stream) * 1000)
+        _merged_meta_stream = dict(extra_metadata) if extra_metadata else {}
+        _merged_meta_stream["latency_ms"] = _latency_ms_stream
+        _merged_meta_stream["status_code"] = 200
         try:
             from sqlalchemy.ext.asyncio import AsyncSession as _AS2
-            from tiresias.storage.engine import get_engine as _ge
+            from tiresias.storage.engine import get_engine as _ge, set_tenant_context as _stc2
 
             engine = await _ge(tenant_id, settings.data_root)
             async with _AS2(engine) as db_session:
+                await _stc2(db_session, tenant_id)
                 await record_turn(
                     tenant_id=tenant_id,
                     model=model,
@@ -624,7 +653,7 @@ async def _handle_streaming(
                     request_body=body,
                     response_body=accumulated_response,
                     session_id=session_id,
-                    metadata=extra_metadata,
+                    metadata=_merged_meta_stream,
                     envelope=envelope,
                     db_session=db_session,
                 )
@@ -700,3 +729,4 @@ def _assemble_sse_response(full_sse_text, model):
 
 
 app = create_app()
+

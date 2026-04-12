@@ -56,3 +56,4 @@ def extract_usage_from_response(response_json: dict) -> dict[str, int]:
         "completion_tokens": completion_tokens,
         "total_tokens": total_tokens,
     }
+

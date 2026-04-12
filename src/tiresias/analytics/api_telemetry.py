@@ -160,3 +160,4 @@ async def get_cost_by_endpoint(
         }
         for row in rows
     ]
+

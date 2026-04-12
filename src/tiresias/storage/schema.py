@@ -37,6 +37,8 @@ class TiresiasAuditLog(Base):
     model: Mapped[str | None] = mapped_column(String(128), nullable=True)
     provider: Mapped[str | None] = mapped_column(String(64), nullable=True)
     token_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    completion_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     session_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -52,7 +54,7 @@ class TiresiasLicense(Base):
     __tablename__ = "tiresias_licenses"
 
     tenant_id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    tier: Mapped[str] = mapped_column(String(32), default="free", nullable=False)
+    tier: Mapped[str] = mapped_column(String(32), default="community", nullable=False)
     feature_flags: Mapped[str | None] = mapped_column(Text, nullable=True)
     kek_provider: Mapped[str] = mapped_column(String(32), default="local", nullable=False)
     retention_days: Mapped[int] = mapped_column(Integer, default=30, nullable=False)
@@ -61,7 +63,6 @@ class TiresiasLicense(Base):
     config_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     expiry: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    jwt_signature: Mapped[str | None] = mapped_column(String(512), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
     )
@@ -119,3 +120,4 @@ class TiresiasApiEndpointBucket(Base):
     __table_args__ = (
         UniqueConstraint("tenant_id", "api_service", "method", "path_pattern", "bucket_hour"),
     )
+

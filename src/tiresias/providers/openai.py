@@ -20,11 +20,10 @@ class OpenAIProvider(BaseProvider):
 
     def format_request(self, body: dict) -> tuple[str, dict, dict]:
         url = f"{self._api_base}/v1/chat/completions"
-        headers: dict[str, str] = {}
-        if self._api_key:
-            headers["Authorization"] = f"Bearer {self._api_key}"
+        headers = {"Authorization": f"Bearer {self._api_key}"}
         return url, headers, dict(body)
 
     def parse_response(self, response_json: dict) -> dict:
         # OpenAI format is already the canonical format.
         return response_json
+

@@ -79,3 +79,4 @@ async def first_boot(
     logger.info(border)
 
     return api_key
+

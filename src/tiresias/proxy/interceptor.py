@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from hashlib import sha256
 from uuid import uuid4
@@ -64,6 +65,8 @@ async def record_turn(
         model=model,
         provider=provider,
         token_count=total_tokens,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
         cost_usd=cost_usd,
         session_id=session_id,
         metadata_json=json.dumps(metadata) if metadata else None,
@@ -88,6 +91,8 @@ async def record_turn(
         "model": model,
         "provider": provider,
         "token_count": total_tokens,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
         "cost_usd": cost_usd,
         "session_id": session_id,
         "request_hash": request_hash,
@@ -95,6 +100,12 @@ async def record_turn(
         "created_at": now,
     }
     await db_session.commit()
+
+    # Extract and report tool invocations to SoulWatch (fire-and-forget)
+    tool_calls = _extract_tool_calls(response_body)
+    if tool_calls:
+        _report_tool_invocations(tool_calls, tenant_id, model, provider, session_id)
+
     return snapshot
 
 
@@ -149,6 +160,74 @@ async def _upsert_usage_bucket(
         bucket.request_count += 1
 
 
+def _extract_tool_calls(response_body: dict) -> list[dict]:
+    """Extract tool invocations from LLM response (Claude + OpenAI formats)."""
+    calls = []
+    # Claude format: content blocks with type=tool_use
+    for block in response_body.get("content", []):
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            calls.append({
+                "tool_call_id": block.get("id", ""),
+                "tool_name": block.get("name", ""),
+                "arguments": json.dumps(block.get("input", {})),
+            })
+    # OpenAI format: choices[0].message.tool_calls
+    for choice in response_body.get("choices", []):
+        for tc in (choice.get("message", {}).get("tool_calls", []) or []):
+            fn = tc.get("function", {})
+            calls.append({
+                "tool_call_id": tc.get("id", ""),
+                "tool_name": fn.get("name", ""),
+                "arguments": fn.get("arguments", "{}"),
+            })
+    return calls
+
+
+def _report_tool_invocations(tool_calls, tenant_id, model, provider, session_id):
+    """Fire-and-forget POST tool invocations to SoulWatch."""
+    import httpx
+    import uuid as _uuid
+
+    soulwatch_url = os.environ.get("SOULWATCH_URL", "http://soulwatch-mssp:8001")
+    for tc in tool_calls:
+        payload = {
+            "event_type": "tool_invocation",
+            "version": "1.0",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "agent_id": session_id or "unknown",
+            "tenant_id": tenant_id,
+            "invocation_id": f"inv_{_uuid.uuid4().hex[:12]}",
+            "command": tc["tool_name"],
+            "args": tc["arguments"],
+            "full_command": f"{tc['tool_name']}({tc['arguments'][:200]})",
+            "working_directory": None,
+            "execution": {
+                "exit_code": 0,
+                "duration_ms": 0,
+                "stdout_bytes": 0,
+                "stderr_bytes": 0,
+            },
+            "policy": {"evaluated": False, "verdict": "skipped"},
+            "sanitizer": {"mode": "passthrough", "verdict": "skipped"},
+        }
+        try:
+            internal_key = os.environ.get("SOULWATCH_INTERNAL_API_KEY", "")
+            headers = {"X-Internal-Key": internal_key} if internal_key else {}
+            resp = httpx.post(
+                f"{soulwatch_url}/watch/v1/events",
+                json=payload,
+                headers=headers,
+                timeout=2.0,
+            )
+            resp.raise_for_status()
+        except Exception as exc:
+            logger.warning(
+                "SoulWatch tool event failed for %s: %s",
+                tc["tool_name"],
+                exc,
+            )
+
+
 def _extract_completion_text(response_body: dict) -> str:
     choices = response_body.get("choices", [])
     if not choices:
@@ -160,3 +239,4 @@ def _extract_completion_text(response_body: dict) -> str:
         return str(content)
     delta = first.get("delta", {})
     return str(delta.get("content", ""))
+

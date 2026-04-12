@@ -33,4 +33,10 @@ class BaseProvider(ABC):
 
     def is_error(self, status_code: int) -> bool:
         """Return True if the status code should trigger failover to next provider."""
-        return status_code >= 500
+        return status_code >= 500 or status_code == 429
+
+    def is_client_error(self, status_code: int) -> bool:
+        """Return True if this is a client error that should be returned to the caller
+        rather than silently parsed as a successful response."""
+        return 400 <= status_code < 500 and status_code != 429
+

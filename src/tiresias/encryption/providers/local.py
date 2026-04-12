@@ -8,7 +8,10 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-from tiresias.encryption.providers.base import KEKProvider
+try:
+    from tiresias.encryption.providers.base import KEKProvider
+except ModuleNotFoundError:
+    from src.tiresias.encryption.providers.base import KEKProvider
 
 _HKDF_SALT = b"tiresias-kek-v1"
 _HKDF_INFO = b"kek-derivation"
@@ -77,3 +80,4 @@ class LocalKEKProvider(KEKProvider):
         ct = wrapped_dek[_NONCE_SIZE:]
         aesgcm = AESGCM(self._kek)
         return aesgcm.decrypt(nonce, ct, None)
+

@@ -70,3 +70,4 @@ async def get_session_stats(session_id: str, db_session: AsyncSession) -> dict:
         "first_request_at": records[0].created_at.isoformat() if records else None,
         "last_request_at": records[-1].created_at.isoformat() if records else None,
     }
+

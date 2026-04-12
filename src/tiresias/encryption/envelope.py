@@ -6,9 +6,14 @@ from typing import TYPE_CHECKING
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tiresias.encryption.aead import decrypt_field, encrypt_field, make_dek
-from tiresias.encryption.providers.base import KEKProvider
-from tiresias.storage.schema import TiresiasLicense
+try:
+    from tiresias.encryption.aead import decrypt_field, encrypt_field, make_dek
+    from tiresias.encryption.providers.base import KEKProvider
+    from tiresias.storage.schema import TiresiasLicense
+except ModuleNotFoundError:
+    from src.tiresias.encryption.aead import decrypt_field, encrypt_field, make_dek
+    from src.tiresias.encryption.providers.base import KEKProvider
+    from src.tiresias.storage.schema import TiresiasLicense
 
 if TYPE_CHECKING:
     pass
@@ -111,3 +116,4 @@ class EnvelopeEncryption:
         # Update cache with new provider context (DEK unchanged)
         self._dek_cache[tenant_id] = dek
         logger.info("DEK rotation complete for tenant %s -> provider %s", tenant_id, new_provider.provider_name)
+

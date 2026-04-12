@@ -16,6 +16,8 @@ async def get_spend_summary(db_session: AsyncSession, tenant_id: str, start: dat
             func.sum(TiresiasAuditLog.cost_usd).label("total_cost"),
             func.count(TiresiasAuditLog.id).label("request_count"),
             func.sum(TiresiasAuditLog.token_count).label("total_tokens"),
+            func.sum(TiresiasAuditLog.prompt_tokens).label("total_prompt_tokens"),
+            func.sum(TiresiasAuditLog.completion_tokens).label("total_completion_tokens"),
         )
         .where(
             TiresiasAuditLog.tenant_id == tenant_id,
@@ -27,9 +29,11 @@ async def get_spend_summary(db_session: AsyncSession, tenant_id: str, start: dat
     result = await db_session.execute(stmt)
     row = result.one()
     return {
-        "total_cost_usd": round(float(row.total_cost or 0.0), 8),
-        "request_count": int(row.request_count or 0),
+        "total_cost": round(float(row.total_cost or 0.0), 8),
         "total_tokens": int(row.total_tokens or 0),
+        "total_prompt_tokens": int(row.total_prompt_tokens or 0),
+        "total_completion_tokens": int(row.total_completion_tokens or 0),
+        "request_count": int(row.request_count or 0),
         "start": start.isoformat(),
         "end": end.isoformat(),
     }
@@ -57,13 +61,13 @@ async def get_requests_per_day(db_session: AsyncSession, tenant_id: str, start: 
             dt = dt.replace(tzinfo=timezone.utc)
         day_key = dt.strftime("%Y-%m-%d")
         if day_key not in day_counts:
-            day_counts[day_key] = {"date": day_key, "request_count": 0, "cost_usd": 0.0}
-        day_counts[day_key]["request_count"] += 1
+            day_counts[day_key] = {"date": day_key, "count": 0, "cost_usd": 0.0}
+        day_counts[day_key]["count"] += 1
         day_counts[day_key]["cost_usd"] = round(
             day_counts[day_key]["cost_usd"] + float(row.cost_usd or 0.0), 8
         )
 
-    return sorted(day_counts.values(), key=lambda x: x["date"])
+    return {"counts": sorted(day_counts.values(), key=lambda x: x["date"])}
 
 
 async def get_latency_percentiles(db_session: AsyncSession, tenant_id: str, start: datetime, end: datetime) -> list[dict]:
@@ -105,11 +109,11 @@ async def get_latency_percentiles(db_session: AsyncSession, tenant_id: str, star
             return round(data[idx], 2)
 
         output.append({
-            "provider": provider,
+            "name": provider,
             "sample_count": len(sorted_lat),
-            "p50_ms": percentile(sorted_lat, 50),
-            "p95_ms": percentile(sorted_lat, 95),
-            "p99_ms": percentile(sorted_lat, 99),
+            "p50": percentile(sorted_lat, 50),
+            "p95": percentile(sorted_lat, 95),
+            "p99": percentile(sorted_lat, 99),
         })
 
     return output
@@ -158,11 +162,14 @@ async def get_error_rates(db_session: AsyncSession, tenant_id: str, start: datet
         total = stats["total"]
         errors = stats["errors"]
         output.append({
-            "provider": provider,
+            "name": provider,
             "total_requests": total,
             "error_count": errors,
             "error_rate": round(errors / total, 4) if total > 0 else 0.0,
-            "status_codes": stats["status_codes"],
+            "status_codes": [
+                {"code": int(code), "count": count}
+                for code, count in stats["status_codes"].items()
+            ],
         })
 
     return output
@@ -182,6 +189,8 @@ async def get_top_sessions(
             func.sum(TiresiasAuditLog.cost_usd).label("total_cost"),
             func.count(TiresiasAuditLog.id).label("request_count"),
             func.sum(TiresiasAuditLog.token_count).label("total_tokens"),
+            func.sum(TiresiasAuditLog.prompt_tokens).label("total_prompt_tokens"),
+            func.sum(TiresiasAuditLog.completion_tokens).label("total_completion_tokens"),
             func.min(TiresiasAuditLog.created_at).label("first_at"),
             func.max(TiresiasAuditLog.created_at).label("last_at"),
         )
@@ -208,15 +217,17 @@ async def get_top_sessions(
         if last_at and hasattr(last_at, "isoformat"):
             last_at = last_at.isoformat()
         output.append({
-            "session_id": row.session_id,
-            "total_cost_usd": round(float(row.total_cost or 0.0), 8),
-            "request_count": int(row.request_count or 0),
-            "total_tokens": int(row.total_tokens or 0),
+            "id": row.session_id,
+            "cost": round(float(row.total_cost or 0.0), 8),
+            "requests": int(row.request_count or 0),
+            "tokens": int(row.total_tokens or 0),
+            "prompt_tokens": int(row.total_prompt_tokens or 0),
+            "completion_tokens": int(row.total_completion_tokens or 0),
             "first_request_at": first_at,
-            "last_request_at": last_at,
+            "last_active": last_at,
         })
 
-    return output
+    return {"sessions": output}
 
 
 async def get_session_replay(
@@ -238,22 +249,28 @@ async def get_session_replay(
     result = await db_session.execute(stmt)
     rows = result.scalars().all()
 
+    # Resolve DEK once for the entire session replay
+    dek = None
+    if envelope is not None:
+        try:
+            dek = await envelope.get_or_create_dek(tenant_id, db_session)
+        except Exception:
+            pass
+
     turns = []
-    for row in rows:
+    for idx, row in enumerate(rows, start=1):
         prompt_text = None
         completion_text = None
 
-        if row.encrypted_prompt and envelope is not None:
+        if row.encrypted_prompt and dek is not None:
             try:
-                raw = await envelope.decrypt(tenant_id, row.encrypted_prompt, db_session)
-                prompt_text = raw.decode("utf-8", errors="replace")
+                prompt_text = await envelope.decrypt(row.encrypted_prompt, dek)
             except Exception:
                 prompt_text = "[decryption failed]"
 
-        if row.encrypted_completion and envelope is not None:
+        if row.encrypted_completion and dek is not None:
             try:
-                raw = await envelope.decrypt(tenant_id, row.encrypted_completion, db_session)
-                completion_text = raw.decode("utf-8", errors="replace")
+                completion_text = await envelope.decrypt(row.encrypted_completion, dek)
             except Exception:
                 completion_text = "[decryption failed]"
 
@@ -265,15 +282,128 @@ async def get_session_replay(
                 pass
 
         turns.append({
+            "turn": idx,
             "id": row.id,
             "model": row.model,
             "provider": row.provider,
-            "token_count": row.token_count,
-            "cost_usd": row.cost_usd,
-            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "tokens": row.token_count,
+            "cost": row.cost_usd,
+            "prompt_tokens": row.prompt_tokens,
+            "completion_tokens": row.completion_tokens,
+            "timestamp": row.created_at.isoformat() if row.created_at else None,
+            "latency_ms": metadata.get("latency_ms"),
             "prompt": prompt_text,
             "completion": completion_text,
             "metadata": metadata,
         })
 
-    return turns
+    total_cost = round(sum(float(t["cost"] or 0) for t in turns), 8)
+    total_tokens = sum(int(t["tokens"] or 0) for t in turns)
+
+    duration_ms = 0
+    if len(turns) >= 2 and rows[0].created_at and rows[-1].created_at:
+        delta = rows[-1].created_at - rows[0].created_at
+        duration_ms = int(delta.total_seconds() * 1000)
+
+    return {
+        "turns": turns,
+        "total_cost": total_cost,
+        "total_tokens": total_tokens,
+        "duration_ms": duration_ms,
+    }
+
+
+async def get_traces(
+    db_session: AsyncSession,
+    tenant_id: str,
+    start: datetime,
+    end: datetime,
+    page: int = 1,
+    limit: int = 20,
+    provider: str | None = None,
+    model: str | None = None,
+    status: str | None = None,
+    date: str | None = None,
+    search: str | None = None,
+) -> dict:
+    """Return paginated individual audit log rows with optional filters."""
+    conditions = [
+        TiresiasAuditLog.tenant_id == tenant_id,
+        TiresiasAuditLog.created_at >= start,
+        TiresiasAuditLog.created_at <= end,
+        TiresiasAuditLog.deleted_at.is_(None),
+    ]
+    if provider:
+        conditions.append(TiresiasAuditLog.provider == provider)
+    if model:
+        conditions.append(TiresiasAuditLog.model.ilike(f"%{model}%"))
+    if date:
+        from sqlalchemy import cast, Date as SADate
+        conditions.append(cast(TiresiasAuditLog.created_at, SADate) == date)
+    if search:
+        conditions.append(TiresiasAuditLog.session_id.ilike(f"%{search}%"))
+
+    count_stmt = select(func.count(TiresiasAuditLog.id)).where(*conditions)
+    count_result = await db_session.execute(count_stmt)
+    total = count_result.scalar() or 0
+
+    offset = (page - 1) * limit
+    stmt = (
+        select(TiresiasAuditLog)
+        .where(*conditions)
+        .order_by(TiresiasAuditLog.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    result = await db_session.execute(stmt)
+    rows = result.scalars().all()
+
+    items = []
+    for row in rows:
+        metadata = {}
+        if row.metadata_json:
+            try:
+                metadata = json.loads(row.metadata_json)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        latency_ms = metadata.get("latency_ms", 0)
+        status_code = metadata.get("status_code")
+        has_error = metadata.get("error", False)
+
+        if status == "error" and not (has_error or (status_code and int(status_code) >= 400)):
+            continue
+        if status == "success" and (has_error or (status_code and int(status_code) >= 400)):
+            continue
+        if status == "timeout" and not metadata.get("timeout", False):
+            continue
+
+        row_status = "success"
+        if has_error or (status_code and int(status_code) >= 400):
+            row_status = "error"
+        if metadata.get("timeout"):
+            row_status = "timeout"
+
+        items.append({
+            "id": row.id,
+            "timestamp": row.created_at.isoformat() if row.created_at else None,
+            "session_id": row.session_id,
+            "model": row.model or "unknown",
+            "provider": row.provider or "unknown",
+            "tokens": int(row.token_count or 0),
+            "prompt_tokens": int(row.prompt_tokens or 0),
+            "completion_tokens": int(row.completion_tokens or 0),
+            "cost": round(float(row.cost_usd or 0.0), 8),
+            "latency_ms": latency_ms if latency_ms else 0,
+            "status": row_status,
+            "request_hash": row.request_hash,
+            "response_hash": row.response_hash,
+        })
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "limit": limit,
+    }
+

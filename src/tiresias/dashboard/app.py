@@ -86,9 +86,10 @@ def create_dashboard_app(
     )
 
     # Build the auth dependency using the factory (no circular imports)
-    from tiresias.dashboard.auth import make_api_key_dependency
-    _require_api_key = make_api_key_dependency(get_dash_settings, get_dash_engine)
-    AuthDep = Annotated[str, Depends(_require_api_key)]
+    # Uses make_auth_dependency which accepts X-SoulKey OR API key
+    from tiresias.dashboard.auth import make_auth_dependency
+    _require_auth = make_auth_dependency(get_dash_settings, get_dash_engine)
+    AuthDep = Annotated[str, Depends(_require_auth)]
 
     # ─── Health (no auth) ────────────────────────────────────────────────────
 
@@ -120,7 +121,7 @@ def create_dashboard_app(
         _key: AuthDep,
         start: str | None = Query(default=None),
         end: str | None = Query(default=None),
-    ) -> list:
+    ) -> dict:
         from tiresias.dashboard.analytics import get_requests_per_day
         cfg = get_dash_settings()
         default_start, default_end = _default_window()
@@ -172,7 +173,7 @@ def create_dashboard_app(
         start: str | None = Query(default=None),
         end: str | None = Query(default=None),
         limit: int = Query(default=20, ge=1, le=100),
-    ) -> list:
+    ) -> dict:
         from tiresias.dashboard.analytics import get_top_sessions
         cfg = get_dash_settings()
         default_start, default_end = _default_window()
@@ -211,11 +212,11 @@ def create_dashboard_app(
         statuses = health.status()
         for s in statuses:
             if s["is_healthy"]:
-                s["status"] = "up"
+                s["status"] = "UP"
             elif s["consecutive_errors"] >= 3:
-                s["status"] = "down"
+                s["status"] = "DOWN"
             else:
-                s["status"] = "degraded"
+                s["status"] = "DEGRADED"
         return {"cascade": cascade, "providers": statuses}
 
     # ─── Static files (must be last) ─────────────────────────────────────────
@@ -227,3 +228,4 @@ def create_dashboard_app(
 
 
 dashboard_app = create_dashboard_app()
+

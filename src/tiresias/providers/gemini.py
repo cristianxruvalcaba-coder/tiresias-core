@@ -86,3 +86,4 @@ class GeminiProvider(BaseProvider):
                 "total_tokens": prompt_tokens + completion_tokens,
             },
         }
+

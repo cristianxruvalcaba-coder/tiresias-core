@@ -25,3 +25,4 @@ class KEKProvider(ABC):
     async def unwrap_dek(self, wrapped_dek: bytes) -> bytes:
         """Decrypt (unwrap) a wrapped DEK. Returns plaintext DEK bytes."""
         ...
+

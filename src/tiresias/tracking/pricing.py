@@ -23,6 +23,8 @@ PRICING_TABLE: dict[str, dict[str, float]] = {
     "claude-sonnet-4-5": {"input": 3.00, "output": 15.00},
     "claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
     "claude-opus-4-5": {"input": 15.00, "output": 75.00},
+    "claude-haiku-4-5-20251001": {"input": 0.80, "output": 4.00},
+    "claude-opus-4-6": {"input": 15.00, "output": 75.00},
     # Gemini
     "gemini-1.5-pro": {"input": 1.25, "output": 5.00},
     "gemini-1.5-flash": {"input": 0.075, "output": 0.30},
@@ -51,8 +53,11 @@ MODEL_PREFIX_FALLBACK: list[tuple[str, str]] = [
     ("claude-3-opus", "claude-3-opus-20240229"),
     ("claude-3-sonnet", "claude-3-sonnet-20240229"),
     ("claude-3-haiku", "claude-3-haiku-20240307"),
-    ("claude-sonnet-4", "claude-sonnet-4-5"),
-    ("claude-opus-4", "claude-opus-4-5"),
+    ("claude-haiku-4-5", "claude-haiku-4-5-20251001"),
+    ("claude-sonnet-4-6", "claude-sonnet-4-6"),
+    ("claude-sonnet-4", "claude-sonnet-4-6"),
+    ("claude-opus-4-6", "claude-opus-4-6"),
+    ("claude-opus-4", "claude-opus-4-6"),
     ("gemini-2.0-flash-lite", "gemini-2.0-flash-lite"),
     ("gemini-2.0-flash", "gemini-2.0-flash"),
     ("gemini-1.5-pro", "gemini-1.5-pro"),
@@ -89,3 +94,4 @@ def get_pricing(model: str):
     if resolved is None:
         return None
     return PRICING_TABLE[resolved]
+

@@ -84,3 +84,4 @@ def list_services() -> list[str]:
 def get_service_pricing(api_service: str) -> dict[str, float] | None:
     """Return full pricing table for a service, or None if unknown."""
     return _SERVICE_TABLES.get(api_service.lower())
+

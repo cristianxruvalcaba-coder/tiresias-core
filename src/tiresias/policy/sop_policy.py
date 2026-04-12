@@ -1,15 +1,7 @@
 """SOP policy models for Tiresias PDP extension."""
 from __future__ import annotations
 
-import re
-
 from pydantic import BaseModel
-
-
-class SOPRuleConditions(BaseModel):
-    """Optional conditions that narrow when a rule matches."""
-
-    model_pattern: str | None = None  # regex matched against model name
 
 
 class SOPRule(BaseModel):
@@ -23,7 +15,6 @@ class SOPRule(BaseModel):
     time_window: str | None = None
     allowed_outputs: list[str] = ["*"]
     max_spend_usd: float | None = None
-    conditions: SOPRuleConditions | None = None
 
 
 class SOPPolicy(BaseModel):
@@ -33,25 +24,11 @@ class SOPPolicy(BaseModel):
     default_action: str = "deny"
     enforcement: str = "strict"
 
-    def find_matching_rule(
-        self, sop_id: str, action: str, context: dict | None = None,
-    ) -> SOPRule | None:
-        """Find first rule matching sop_id where action is in allowed_actions.
-
-        When *context* is provided and a rule has conditions.model_pattern,
-        the pattern is tested against context["model"].  Rules whose
-        model_pattern does not match are skipped.
-        """
-        ctx = context or {}
-        model = ctx.get("model", "")
+    def find_matching_rule(self, sop_id: str, action: str) -> SOPRule | None:
+        """Find first rule matching sop_id where action is in allowed_actions."""
         for rule in self.rules:
-            if rule.sop_id != sop_id or action not in rule.allowed_actions:
-                continue
-            # Check model_pattern condition if present
-            if rule.conditions and rule.conditions.model_pattern:
-                if not re.fullmatch(rule.conditions.model_pattern, model):
-                    continue
-            return rule
+            if rule.sop_id == sop_id and action in rule.allowed_actions:
+                return rule
         return None
 
 
@@ -64,3 +41,4 @@ class SOPDecision(BaseModel):
     reason: str
     audit_ref: str  # UUID of audit log entry
     approval_id: str | None = None
+

@@ -35,3 +35,4 @@ def decrypt_field(blob: bytes, dek: bytes) -> str:
     aesgcm = AESGCM(dek)
     plaintext_bytes = aesgcm.decrypt(nonce, ciphertext, None)
     return plaintext_bytes.decode("utf-8")
+
